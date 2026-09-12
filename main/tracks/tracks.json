@@ -40,5 +40,48 @@
     "title": "Unreeeal Superhero 3",
     "artist": "rez + kenet",
     "format": "XM 10CH"
+  },
+  {
+    "file": "ability_nfmmix.mod",
+    "title": "Ability",
+    "artist": "Style",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "airwave-aberration_mix.xm",
+    "title": "Airwave (Aberration)",
+    "artist": "Aberration",
+    "format": "XM 32CH"
+  },
+  {
+    "file": "castlevania.mod",
+    "title": "Castlevania 4",
+    "artist": "Sam",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "musiklinjen.mod",
+    "title": "Musiklinjen",
+    "artist": "Firefox & Tip",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "rebirth_of_the_lamer.xm",
+    "title": "Rebirth of the Lamer",
+    "artist": "lepra & marwin",
+    "format": "XM 16CH"
+  },
+  {
+    "file": "saga_musix_-_jetpack_2_-_going_on.mod",
+    "title": "Going On",
+    "artist": "Saga Musix",
+    "format": "MOD 8CH"
+  },
+  {
+    "file": "serpents.mod",
+    "title": "Serpents",
+    "artist": "Moby",
+    "format": "MOD 4CH"
   }
 ]
+
