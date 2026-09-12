@@ -4,6 +4,12 @@
 
 基于硬件级优化，纯离线实时合成解码 4 通道 ProTracker `.mod` 与多通道 FastTracker 2 `.xm` 格式，驱动 ES8311 芯片进行高品质 I2S 音频输出。屏幕以复古绿黑终端风格实时可视化展示通道乐谱走带、触发音符、电平跳动与播放参数，并内置暗光像素屏保。
 
+<p align="center">
+  <img src="images/cover_3x4.png" width="360" alt="Tracker Player Real Hardware Cover" />
+  &nbsp;&nbsp;
+  <img src="images/gameplay_3x4.png" width="360" alt="Space Invader Screensaver Mode" />
+</p>
+
 ---
 
 ## 🎮 按键交互指南
