@@ -1,0 +1,44 @@
+[
+  {
+    "file": "stardstm.mod",
+    "title": "Stardust Memories",
+    "artist": "Jogeir Liljedahl",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "spacedeb.mod",
+    "title": "Space Debris",
+    "artist": "Captain / Markus K",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "elysium.mod",
+    "title": "Elysium",
+    "artist": "Jester / Sanity",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "goa.mod",
+    "title": "Goa",
+    "artist": "Necros",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "moongazr.mod",
+    "title": "moongazer",
+    "artist": "Virgill",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "thuglive.mod",
+    "title": "ThugLive",
+    "artist": "beek",
+    "format": "MOD 4CH"
+  },
+  {
+    "file": "unreeeal_superhero_3.xm",
+    "title": "Unreeeal Superhero 3",
+    "artist": "rez + kenet",
+    "format": "XM 10CH"
+  }
+]

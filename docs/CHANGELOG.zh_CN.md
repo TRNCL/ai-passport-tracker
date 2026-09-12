@@ -6,6 +6,8 @@
 
 ## Unreleased
 
+- 新增 Tracker/MOD 音乐播放器 demo（`main/demo_tracker.c`）：基于零拷贝 PocketMod 引擎，在无 PSRAM 的 ESP32-C3 上实现 ProTracker 4 轨 MOD 音乐实时立体声混音与 I2S 输出；界面提供 4 通道实时跳动 VU 电平柱、音符矩阵与歌曲元信息；内置三首经典公版 Chiptune 演示曲目（Stardust Memories、Elysium、Sundown）。
+
 - 加入厂家为优特利 520mAh 电芯生成的 80 字节 CW2017 profile，并实现内容与更新标志检查、写入后校验、规定的重启时序以及有上限的 SOC 就绪等待。
 
 - 扩充环境引导文档：新增乐鑫 Git 服务镜像（`git.espressif.com.cn`）作为中国大陆首选线路，覆盖 ESP-IDF v5.5.3 及其子模块；补充子模块长等待/超时处理、原地修复，以及 `esp32-wifi-lib` 等大仓的按钉死 commit 浅取；提示按仓库残留的 Jihulab `insteadOf` 旧配置；并把官方离线 release 压缩包加入兜底方案（经验来自 `esp-mosaico/esp-mosaico-vibe`）。

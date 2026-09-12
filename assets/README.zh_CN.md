@@ -32,3 +32,15 @@
 - 与当前 BSP 音频路径匹配时优先采用 16 kHz、16 位单声道 PCM。
 - 嵌入音频前评估 Flash 与内部 RAM 成本；长录音应流式或分块。
 - 无再分发许可不提交媒体文件。
+
+| 文件 | 格式 | 来源 / 作者 | 许可 | 用途 |
+| --- | --- | --- | --- | --- |
+| `music/stardstm.mod` | ProTracker 4CH MOD | Jogeir Liljedahl (1991) | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/spacedeb.mod` | ProTracker 4CH MOD | Captain / Markus Kaarlonen (1991) | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/elysium.mod` | ProTracker 4CH MOD | Jester / Sanity (1991) | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/supernova.mod` | ProTracker 4CH MOD | Amiga Demoscene | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/nemesis.mod` | ProTracker 4CH MOD | Nemesis Theory | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/sundown.mod` | ProTracker 4CH MOD | Amiga Scene | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/overture.mod` | ProTracker 4CH MOD | Demoscene | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/king.mod` | ProTracker 4CH MOD | Demoscene | Public Domain / Mod Archive | Tracker 播放器演示曲目 |
+| `music/chill.mod` | ProTracker 4CH MOD | Demoscene | Public Domain / Mod Archive | Tracker 播放器演示曲目 |

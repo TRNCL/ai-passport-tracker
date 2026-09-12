@@ -34,3 +34,15 @@ Store reusable music and sound-effect sources in `music/`.
 - Prefer 16 kHz, 16-bit mono PCM when it matches the current BSP audio path.
 - Check Flash and internal-RAM cost before embedding audio; stream or chunk long recordings.
 - Do not commit media without redistribution permission.
+
+| File | Format | Source / Author | License | Destination |
+| --- | --- | --- | --- | --- |
+| `music/stardstm.mod` | ProTracker 4CH MOD | Jogeir Liljedahl (1991) | Public Domain / Mod Archive | Tracker player demo |
+| `music/spacedeb.mod` | ProTracker 4CH MOD | Captain / Markus Kaarlonen (1991) | Public Domain / Mod Archive | Tracker player demo |
+| `music/elysium.mod` | ProTracker 4CH MOD | Jester / Sanity (1991) | Public Domain / Mod Archive | Tracker player demo |
+| `music/supernova.mod` | ProTracker 4CH MOD | Amiga Demoscene | Public Domain / Mod Archive | Tracker player demo |
+| `music/nemesis.mod` | ProTracker 4CH MOD | Nemesis Theory | Public Domain / Mod Archive | Tracker player demo |
+| `music/sundown.mod` | ProTracker 4CH MOD | Amiga Scene | Public Domain / Mod Archive | Tracker player demo |
+| `music/overture.mod` | ProTracker 4CH MOD | Demoscene | Public Domain / Mod Archive | Tracker player demo |
+| `music/king.mod` | ProTracker 4CH MOD | Demoscene | Public Domain / Mod Archive | Tracker player demo |
+| `music/chill.mod` | ProTracker 4CH MOD | Demoscene | Public Domain / Mod Archive | Tracker player demo |

@@ -1,0 +1,2600 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+
+#include <assert.h>
+
+#include "ibxm.h"
+
+#define TAG "IBXM_LIB"
+
+/* Logging compat: define LOGI/LOGW/LOGE if not supplied */
+#ifndef LOGI
+#define LOGI( tag, fmt, ... ) ESP_LOGI( tag, fmt, ##__VA_ARGS__ )
+#define LOGW( tag, fmt, ... ) ESP_LOGW( tag, fmt, ##__VA_ARGS__ )
+#define LOGE( tag, fmt, ... ) ESP_LOGE( tag, fmt, ##__VA_ARGS__ )
+#endif
+
+const char *IBXM_VERSION = "ibxm/ac mod/xm/s3m replay 20190513 (c)mumart@gmail.com";
+
+static void* ibxm_calloc_dram( size_t num, size_t size ) {
+	return calloc( num, size );
+}
+
+static void* ibxm_calloc_psram( size_t num, size_t size ) {
+	return calloc( num, size );
+}
+
+/* Forward declarations for the data-access helpers defined later in this
+   file (data_u8, data_s8, data_sam_s8, data_sam_s16le). The streaming helpers
+   below call them and are placed before those definitions. */
+static int data_u8( struct data *data, int offset );
+static int data_s8( struct data *data, int offset );
+static void data_sam_s8( struct data *data, int offset, int count, short *dest );
+static void data_sam_s16le( struct data *data, int offset, int count, short *dest );
+
+/* ---- On-demand streaming for DRAM-constrained ESP32 (no usable PSRAM) ----
+   When module->stream is set (openArray / flash-mmap path), PCM samples and
+   pattern tables are NOT all resident at once. Each is decoded from the
+   durable module source (module->src, i.e. the flash mmap) on first use and
+   evicted under a small LRU when the DRAM budget is exceeded. This keeps the
+   peak footprint of a ~350 KB S3M (PCM + patterns) well under the ~280 KB
+   free internal DRAM. */
+
+/* ===========================================================================
+   Streaming vs. eager decode
+   ---------------------------------------------------------------------------
+   IBXM_STREAMING (default 1): decode PCM samples and pattern tables on demand
+   from the durable module source (flash mmap) with an LRU working set. Needed
+   when PSRAM is unavailable (e.g. this board, where PSRAM SCLK is not on the
+   SPI0 bus) and the whole S3M cannot fit in internal DRAM at once.
+
+   Set -DIBXM_STREAMING=0 for a board with working PSRAM: the module is decoded
+   eagerly into PSRAM at load (cheap, no per-tick ensure_* calls).
+   =========================================================================== */
+#ifndef IBXM_STREAMING
+#define IBXM_STREAMING 1
+#endif
+
+#if IBXM_STREAMING
+#ifndef IBXM_SAMPLE_CACHE_BYTES
+/* Decoded-PCM budget in internal DRAM. Tuned to the ~51 KB free DRAM on this
+   PSRAM-less board. */
+#define IBXM_SAMPLE_CACHE_BYTES (30 * 1024)
+#endif
+#ifndef IBXM_MAX_RESIDENT_PATTERNS
+/* At most this many patterns unpacked at once (each ~ num_channels*64*5 B). */
+#define IBXM_MAX_RESIDENT_PATTERNS 2
+#endif
+
+static int g_stream_tick = 0;  /* monotonic counter for LRU ordering */
+#endif /* IBXM_STREAMING */
+
+
+#if IBXM_STREAMING
+/* Decode one sample's PCM from module->src into sample->data (DRAM). Returns
+   0 on success, -1 on alloc failure. Caller must hold valid module->src. */
+static int decode_sample( struct module *module, struct sample *sample ) {
+	struct data *d = module->src;
+	int sample_length = sample->src_length;
+	sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
+	if( !sample->data ) {
+		return -1;
+	}
+	if( sample->sixteen_bit ) {
+		data_sam_s16le( d, sample->src_offset, sample_length, sample->data );
+	} else {
+		data_sam_s8( d, sample->src_offset, sample_length, sample->data );
+	}
+	if( !sample->is_signed ) {
+		int idx;
+		for( idx = 0; idx < sample_length; idx++ ) {
+			sample->data[ idx ] = ( sample->data[ idx ] & 0xFFFF ) - 32768;
+		}
+	}
+	sample->data[ sample->loop_start + sample->loop_length ] = sample->data[ sample->loop_start ];
+	return 0;
+}
+
+/* Evict least-recently-used decoded samples whose in_use==0 until the decoded
+   PCM working set is under budget. Returns bytes currently resident. */
+static int sample_cache_resident_bytes( struct module *module ) {
+	int total = 0, ins, sam;
+	for( ins = 0; ins <= module->num_instruments; ins++ ) {
+		struct instrument *instrument = &module->instruments[ ins ];
+		if( !instrument->samples ) continue;
+		for( sam = 0; sam < instrument->num_samples; sam++ ) {
+			struct sample *s = &instrument->samples[ sam ];
+			if( s->data && s->in_use == 0 ) {
+				total += ( s->src_length + 1 ) * (int)sizeof( short );
+			}
+		}
+	}
+	return total;
+}
+
+static void sample_cache_evict( struct module *module, int budget ) {
+	int resident = sample_cache_resident_bytes( module );
+	while( resident > budget ) {
+		/* Find LRU not-in-use decoded sample. */
+		struct sample *victim = NULL;
+		int best = 0x7FFFFFFF, ins, sam;
+		for( ins = 0; ins <= module->num_instruments; ins++ ) {
+			struct instrument *instrument = &module->instruments[ ins ];
+			if( !instrument->samples ) continue;
+			for( sam = 0; sam < instrument->num_samples; sam++ ) {
+				struct sample *s = &instrument->samples[ sam ];
+				if( s->data && s->in_use == 0 && s->lru < best ) {
+					best = s->lru; victim = s;
+				}
+			}
+		}
+		if( !victim ) break;  /* nothing evictable (all in use) */
+		resident -= ( victim->src_length + 1 ) * (int)sizeof( short );
+		free( victim->data );
+		victim->data = NULL;
+	}
+}
+
+/* Ensure a sample is decoded and resident. */
+static int ensure_sample( struct module *module, struct sample *sample ) {
+	if( !module->stream ) {
+		/* Eager mode: data was decoded at load time. */
+		return sample->data ? 0 : -1;
+	}
+	if( sample->data ) {
+		sample->lru = g_stream_tick++;
+		return 0;
+	}
+	if( decode_sample( module, sample ) != 0 ) {
+		/* Budget may be exceeded; evict and retry once. */
+		sample_cache_evict( module, IBXM_SAMPLE_CACHE_BYTES );
+		if( decode_sample( module, sample ) != 0 ) {
+			ESP_LOGE(TAG, "ensure_sample: decode failed (DRAM exhausted)");
+			return -1;
+		}
+	}
+	sample->lru = g_stream_tick++;
+	return 0;
+}
+
+/* Unpack one pattern from the source into pattern->data (DRAM), evicting the
+   LRU resident pattern if the resident count would exceed the limit. Uses the
+   channel map stored in the module (identical to eager-load mapping). */
+static int ensure_pattern( struct module *module, int pat ) {
+	struct pattern *p = &module->patterns[ pat ];
+	if( !module->stream ) {
+		return p->data ? 0 : -1;
+	}
+	if( p->data ) {
+		p->lru = g_stream_tick++;
+		return 0;
+	}
+	/* Count currently-unpacked patterns; evict LRU if at the cap. */
+	int resident = 0, idx, victim_idx = -1, best = 0x7FFFFFFF;
+	for( idx = 0; idx < module->num_patterns; idx++ ) {
+		if( module->patterns[ idx ].data ) {
+			resident++;
+			if( module->patterns[ idx ].lru < best ) {
+				best = module->patterns[ idx ].lru; victim_idx = idx;
+			}
+		}
+	}
+	if( resident >= IBXM_MAX_RESIDENT_PATTERNS && victim_idx >= 0 ) {
+		free( module->patterns[ victim_idx ].data );
+		module->patterns[ victim_idx ].data = NULL;
+	}
+	struct data *d = module->src;
+	int num_channels = p->num_channels;
+	char *pattern_data = ibxm_calloc_dram( num_channels * 64, 5 );
+	if( !pattern_data ) {
+		ESP_LOGE(TAG, "ensure_pattern: alloc failed pat=%d", pat);
+		return -1;
+	}
+	p->data = pattern_data;
+	int pat_offset = p->packed_offset;
+	int row = 0, token, key, ins, volume, effect, param, chan;
+	while( row < 64 ) {
+		token = data_u8( d, pat_offset++ );
+		if( token ) {
+			key = ins = 0;
+			if( ( token & 0x20 ) == 0x20 ) {
+				key = data_u8( d, pat_offset++ );
+				ins = data_u8( d, pat_offset++ );
+				if( key < 0xFE ) {
+					key = ( key >> 4 ) * 12 + ( key & 0xF ) + 1;
+				} else if( key == 0xFF ) {
+					key = 0;
+				}
+			}
+			volume = 0;
+			if( ( token & 0x40 ) == 0x40 ) {
+				volume = ( data_u8( d, pat_offset++ ) & 0x7F ) + 0x10;
+				if( volume > 0x50 ) {
+					volume = 0;
+				}
+			}
+			effect = param = 0;
+			if( ( token & 0x80 ) == 0x80 ) {
+				effect = data_u8( d, pat_offset++ );
+				param = data_u8( d, pat_offset++ );
+				if( effect < 1 || effect >= 0x40 ) {
+					effect = param = 0;
+				} else if( effect > 0 ) {
+					effect += 0x80;
+				}
+			}
+			chan = module->channel_map[ token & 0x1F ];
+			if( chan >= 0 ) {
+				int note_offset = ( row * num_channels + chan ) * 5;
+				pattern_data[ note_offset     ] = key;
+				pattern_data[ note_offset + 1 ] = ins;
+				pattern_data[ note_offset + 2 ] = volume;
+				pattern_data[ note_offset + 3 ] = effect;
+				pattern_data[ note_offset + 4 ] = param;
+			}
+		} else {
+			row++;
+		}
+	}
+	p->lru = g_stream_tick++;
+	return 0;
+}
+
+
+#endif /* IBXM_STREAMING */
+static const int FP_SHIFT = 15, FP_ONE = 32768, FP_MASK = 32767;
+
+static const int exp2_table[] = {
+	32768, 32946, 33125, 33305, 33486, 33667, 33850, 34034,
+	34219, 34405, 34591, 34779, 34968, 35158, 35349, 35541,
+	35734, 35928, 36123, 36319, 36516, 36715, 36914, 37114,
+	37316, 37518, 37722, 37927, 38133, 38340, 38548, 38757,
+	38968, 39180, 39392, 39606, 39821, 40037, 40255, 40473,
+	40693, 40914, 41136, 41360, 41584, 41810, 42037, 42265,
+	42495, 42726, 42958, 43191, 43425, 43661, 43898, 44137,
+	44376, 44617, 44859, 45103, 45348, 45594, 45842, 46091,
+	46341, 46593, 46846, 47100, 47356, 47613, 47871, 48131,
+	48393, 48655, 48920, 49185, 49452, 49721, 49991, 50262,
+	50535, 50810, 51085, 51363, 51642, 51922, 52204, 52488,
+	52773, 53059, 53347, 53637, 53928, 54221, 54515, 54811,
+	55109, 55408, 55709, 56012, 56316, 56622, 56929, 57238,
+	57549, 57861, 58176, 58491, 58809, 59128, 59449, 59772,
+	60097, 60423, 60751, 61081, 61413, 61746, 62081, 62419,
+	62757, 63098, 63441, 63785, 64132, 64480, 64830, 65182,
+	65536
+};
+
+static const short sine_table[] = {
+	  0,  24,  49,  74,  97, 120, 141, 161, 180, 197, 212, 224, 235, 244, 250, 253,
+	255, 253, 250, 244, 235, 224, 212, 197, 180, 161, 141, 120,  97,  74,  49,  24
+};
+
+static int exp_2( int x ) {
+	int c, m, y;
+	int x0 = ( x & FP_MASK ) >> ( FP_SHIFT - 7 );
+	c = exp2_table[ x0 ];
+	m = exp2_table[ x0 + 1 ] - c;
+	y = ( m * ( x & ( FP_MASK >> 7 ) ) >> 8 ) + c;
+	return ( y << FP_SHIFT ) >> ( FP_SHIFT - ( x >> FP_SHIFT ) );
+}
+
+static int log_2( int x ) {
+	int step;
+	int y = 16 << FP_SHIFT;
+	for( step = y; step > 0; step >>= 1 ) {
+		if( exp_2( y - step ) >= x ) {
+			y -= step;
+		}
+	}
+	return y;
+}
+
+static char* data_ascii( struct data *data, int offset, int length, char *dest ) {
+	int idx, chr;
+	memset( dest, 32, length );
+	if( offset > data->length ) {
+		offset = data->length;
+	}
+	if( ( unsigned int ) offset + length > ( unsigned int ) data->length ) {
+		length = data->length - offset;
+	}
+	for( idx = 0; idx < length; idx++ ) {
+		chr = data->buffer[ offset + idx ] & 0xFF;
+		if( chr > 32 ) {
+			dest[ idx ] = chr;
+		}
+	}
+	return dest;
+}
+
+static int data_s8( struct data *data, int offset ) {
+	int value = 0;
+	if( offset < data->length ) {
+		value = data->buffer[ offset ];
+		value = ( value & 0x7F ) - ( value & 0x80 );
+	}
+	return value;
+}
+
+static int data_u8( struct data *data, int offset ) {
+	int value = 0;
+	if( offset < data->length ) {
+		value = data->buffer[ offset ] & 0xFF;
+	}
+	return value;
+}
+
+static int data_u16be( struct data *data, int offset ) {
+	int value = 0;
+	if( offset + 1 < data->length ) {
+		value = ( ( data->buffer[ offset ] & 0xFF ) << 8 )
+			| ( data->buffer[ offset + 1 ] & 0xFF );
+	}
+	return value;
+}
+
+static int data_u16le( struct data *data, int offset ) {
+	int value = 0;
+	if( offset + 1 < data->length ) {
+		value = ( data->buffer[ offset ] & 0xFF )
+			| ( ( data->buffer[ offset + 1 ] & 0xFF ) << 8 );
+	}
+	return value;
+}
+
+static unsigned int data_u32le( struct data *data, int offset ) {
+	unsigned int value = 0;
+	if( offset + 3 < data->length ) {
+		value = ( data->buffer[ offset ] & 0xFF )
+			| ( ( data->buffer[ offset + 1 ] & 0xFF ) << 8 )
+			| ( ( data->buffer[ offset + 2 ] & 0xFF ) << 16 )
+			| ( ( data->buffer[ offset + 3 ] & 0xFF ) << 24 );
+	}
+	return value;
+}
+
+static void data_sam_s8( struct data *data, int offset, int count, short *dest ) {
+	int idx, amp, length = data->length;
+	char *buffer = data->buffer;
+	if( offset > length ) {
+		offset = length;
+	}
+	if( offset + count > length ) {
+		count = length - offset;
+	}
+	for( idx = 0; idx < count; idx++ ) {
+		amp = ( buffer[ offset + idx ] & 0xFF ) << 8;
+		dest[ idx ] = ( amp & 0x7FFF ) - ( amp & 0x8000 );
+	}
+}
+
+static void data_sam_s16le( struct data *data, int offset, int count, short *dest ) {
+	int idx, amp, length = data->length;
+	char *buffer = data->buffer;
+	if( offset > length ) {
+		offset = length;
+	}
+	if( offset + count * 2 > length ) {
+		count = ( length - offset ) / 2;
+	}
+	for( idx = 0; idx < count; idx++ ) {
+		amp = ( buffer[ offset + idx * 2 ] & 0xFF ) | ( buffer[ offset + idx * 2 + 1 ] << 8 );
+		dest[ idx ] = ( amp & 0x7FFF ) - ( amp & 0x8000 );
+	}
+}
+
+static int envelope_next_tick( struct envelope *envelope, int tick, int key_on ) {
+	tick++;
+	if( envelope->looped && tick >= envelope->loop_end_tick ) {
+		tick = envelope->loop_start_tick;
+	}
+	if( envelope->sustain && key_on && tick >= envelope->sustain_tick ) {
+		tick = envelope->sustain_tick;
+	}
+	return tick;
+}
+
+static int envelope_calculate_ampl( struct envelope *envelope, int tick ) {
+	int idx, point, dt, da;
+	int ampl = envelope->points_ampl[ envelope->num_points - 1 ];
+	if( tick < envelope->points_tick[ envelope->num_points - 1 ] ) {
+		point = 0;
+		for( idx = 1; idx < envelope->num_points; idx++ ) {
+			if( envelope->points_tick[ idx ] <= tick ) {
+				point = idx;
+			}
+		}
+		dt = envelope->points_tick[ point + 1 ] - envelope->points_tick[ point ];
+		da = envelope->points_ampl[ point + 1 ] - envelope->points_ampl[ point ];
+		ampl = envelope->points_ampl[ point ];
+		ampl += ( ( da << 24 ) / dt ) * ( tick - envelope->points_tick[ point ] ) >> 24;
+	}
+	return ampl;
+}
+
+static void sample_ping_pong( struct sample *sample ) {
+	int idx;
+	int loop_start = sample->loop_start;
+	int loop_length = sample->loop_length;
+	int loop_end = loop_start + loop_length;
+	short *sample_data = sample->data;
+	short *new_data = ibxm_calloc_dram( loop_end + loop_length + 1, sizeof( short ) );
+	if( new_data ) {
+		memcpy( new_data, sample_data, loop_end * sizeof( short ) );
+		for( idx = 0; idx < loop_length; idx++ ) {
+			new_data[ loop_end + idx ] = sample_data[ loop_end - idx - 1 ];
+		}
+		free( sample->data );
+		sample->data = new_data;
+		if( sample->data_length > 0 ) sample->data_length *= 2;
+		sample->loop_length *= 2;
+		sample->data[ loop_start + sample->loop_length ] = sample->data[ loop_start ];
+	}
+}
+
+/* Deallocate the specified module. */
+void dispose_module( struct module *module ) {
+	int idx, sam;
+	struct instrument *instrument;
+	LOGI(TAG, "Freeing: module->default_panning");
+	free( module->default_panning );
+	LOGI(TAG, "Freeing: module->sequence");
+	free( module->sequence );
+	if( module->patterns ) {
+		LOGI(TAG, "Freeing: module->patterns.data");
+		for( idx = 0; idx < module->num_patterns; idx++ ) {
+			free( module->patterns[ idx ].data );
+		}
+		LOGI(TAG, "Freeing: module->patterns");
+		free( module->patterns );
+	}
+	if( module->instruments ) {
+		LOGI(TAG, "Freeing: module->instruments.data");
+		LOGI(TAG, "Freeing: instrument->samples");
+		LOGI(TAG, "Freeing: instrument->samples.data");
+		for( idx = 0; idx <= module->num_instruments; idx++ ) {
+			instrument = &module->instruments[ idx ];
+			if( instrument->samples ) {
+				for( sam = 0; sam < instrument->num_samples; sam++ ) {
+					free( instrument->samples[ sam ].data );
+				}
+				free( instrument->samples );
+			}
+		}
+		LOGI(TAG, "Freeing: module->instruments");
+		free( module->instruments );
+	}
+	LOGI(TAG, "Freeing: module");
+	free( module );
+	LOGI(TAG, "Freeing done.");
+}
+
+static struct module* module_load_xm( struct data *data, int stream) {
+	int delta_env, offset, next_offset, idx, entry;
+	int num_rows, num_notes, pat_data_len, pat_data_offset;
+	int sam, sam_head_offset, sam_data_bytes, sam_data_samples;
+	int num_samples, sam_loop_start, sam_loop_length, amp;
+	int note, flags, key, ins, vol, fxc, fxp;
+	int point, point_tick, point_offset;
+	int looped, ping_pong, sixteen_bit;
+	char ascii[ 16 ], *pattern_data;
+	struct instrument *instrument;
+	struct sample *sample;
+	struct module *module = calloc( 1, sizeof( struct module ) );
+	ESP_LOGE(TAG, "Starting");
+	if( module ) {
+		if( data_u16le( data, 58 ) != 0x0104 ) {
+			ESP_LOGE(TAG, "XM format version must be 0x0104!");
+			dispose_module( module );
+			return NULL;
+		}
+		data_ascii( data, 17, 20, module->name );
+		delta_env = !memcmp( data_ascii( data, 38, 15, ascii ), "DigiBooster Pro", 15 );
+		offset = 60 + data_u32le( data, 60 );
+		module->sequence_len = data_u16le( data, 64 );
+		module->restart_pos = data_u16le( data, 66 );
+		module->num_channels = data_u16le( data, 68 );
+		module->num_patterns = data_u16le( data, 70 );
+		module->num_instruments = data_u16le( data, 72 );
+		module->linear_periods = data_u16le( data, 74 ) & 0x1;
+		module->default_gvol = 64;
+		module->default_speed = data_u16le( data, 76 );
+		module->default_tempo = data_u16le( data, 78 );
+		module->c2_rate = 8363;
+		module->gain = 64;
+		module->default_panning = calloc( module->num_channels + 1, sizeof( unsigned char ) );
+		if( !module->default_panning ) {
+			dispose_module( module );
+			ESP_LOGE(TAG, "default_panning Failed");
+			return NULL;
+		}
+		for( idx = 0; idx < module->num_channels; idx++ ) {
+			module->default_panning[ idx ] = 128;
+		}
+		module->sequence = calloc( module->sequence_len + 1, sizeof( unsigned char ) );
+		if( !module->sequence ) {
+			dispose_module( module );
+			ESP_LOGE(TAG, "sequence Failed");
+			return NULL;
+		}
+		for( idx = 0; idx < module->sequence_len; idx++ ) {
+			entry = data_u8( data, 80 + idx );
+			module->sequence[ idx ] = entry < module->num_patterns ? entry : 0;
+		}
+		module->patterns = calloc( module->num_patterns, sizeof( struct pattern ) );
+		if( !module->patterns ) {
+			dispose_module( module );
+			ESP_LOGE(TAG, "patterns Failed");
+			return NULL;
+		}
+		for( idx = 0; idx < module->num_patterns; idx++ ) {
+			if( data_u8( data, offset + 4 ) ) {
+				ESP_LOGE(TAG, "Unknown pattern packing type!");
+				dispose_module( module );
+				return NULL;
+			}
+			num_rows = data_u16le( data, offset + 5 );
+			if( num_rows < 1 ) {
+				num_rows = 1;
+			}
+			pat_data_len = data_u16le( data, offset + 7 );
+			offset += data_u32le( data, offset );
+			next_offset = offset + pat_data_len;
+			num_notes = num_rows * module->num_channels;
+			module->patterns[ idx ].num_channels = module->num_channels;
+			module->patterns[ idx ].num_rows = num_rows;
+			module->patterns[ idx ].data = NULL;
+			if( module->stream ) {
+				/* Streaming: don't unpack now. Record the packed source offset
+				   so ensure_pattern() can unpack on demand. */
+				module->patterns[ idx ].packed_offset = offset;
+				offset = next_offset;
+				continue;
+			}
+			pattern_data = calloc( num_notes+1, 5 );
+			if( !pattern_data ) {
+				dispose_module( module );
+				ESP_LOGE(TAG, "pattern_data Failed");
+				return NULL;
+			}
+			module->patterns[ idx ].data = pattern_data;
+			if( pat_data_len > 0 ) {
+				pat_data_offset = 0;
+				for( note = 0; note < num_notes; note++ ) {
+					flags = data_u8( data, offset );
+					if( ( flags & 0x80 ) == 0 ) {
+						flags = 0x1F;
+					} else {
+						offset++;
+					}
+					key = ( flags & 0x01 ) > 0 ? data_u8( data, offset++ ) : 0;
+					pattern_data[ pat_data_offset++ ] = key;
+					ins = ( flags & 0x02 ) > 0 ? data_u8( data, offset++ ) : 0;
+					pattern_data[ pat_data_offset++ ] = ins;
+					vol = ( flags & 0x04 ) > 0 ? data_u8( data, offset++ ) : 0;
+					pattern_data[ pat_data_offset++ ] = vol;
+					fxc = ( flags & 0x08 ) > 0 ? data_u8( data, offset++ ) : 0;
+					fxp = ( flags & 0x10 ) > 0 ? data_u8( data, offset++ ) : 0;
+					if( fxc >= 0x40 ) {
+						fxc = fxp = 0;
+					}
+					pattern_data[ pat_data_offset++ ] = fxc;
+					pattern_data[ pat_data_offset++ ] = fxp;
+				}
+			}
+			offset = next_offset;
+		}
+		module->instruments = calloc( module->num_instruments + 1, sizeof( struct instrument ) );
+		if( !module->instruments ) {
+			dispose_module( module );
+			ESP_LOGE(TAG, "instruments Failed");
+			return NULL;
+		}
+		instrument = &module->instruments[ 0 ];
+		instrument->samples = calloc( 1, sizeof( struct sample ) );
+		if( !instrument->samples ) {
+			dispose_module( module );
+			ESP_LOGE(TAG, "samples Failed");
+			return NULL;
+		}
+		for( ins = 1; ins <= module->num_instruments; ins++ ) {
+			instrument = &module->instruments[ ins ];
+			data_ascii( data, offset + 4, 22, instrument->name );
+			num_samples = data_u16le( data, offset + 27 );
+			instrument->num_samples = ( num_samples > 0 ) ? num_samples : 1;
+			instrument->samples = calloc( instrument->num_samples+1, sizeof( struct sample ) );
+			if( !instrument->samples ) {
+				dispose_module( module );
+				ESP_LOGE(TAG, "instrument samples Failed");
+				return NULL;
+			}
+			if( num_samples > 0 ) {
+				for( key = 0; key < 96; key++ ) {
+					instrument->key_to_sample[ key + 1 ] = data_u8( data, offset + 33 + key );
+				}
+				point_tick = 0;
+				for( point = 0; point < 12; point++ ) {
+					point_offset = offset + 129 + ( point * 4 );
+					point_tick = ( delta_env ? point_tick : 0 ) + data_u16le( data, point_offset );
+					instrument->vol_env.points_tick[ point ] = point_tick;
+					instrument->vol_env.points_ampl[ point ] = data_u16le( data, point_offset + 2 );
+				}
+				point_tick = 0;
+				for( point = 0; point < 12; point++ ) {
+					point_offset = offset + 177 + ( point * 4 );
+					point_tick = ( delta_env ? point_tick : 0 ) + data_u16le( data, point_offset );
+					instrument->pan_env.points_tick[ point ] = point_tick;
+					instrument->pan_env.points_ampl[ point ] = data_u16le( data, point_offset + 2 );
+				}
+				instrument->vol_env.num_points = data_u8( data, offset + 225 );
+				if( instrument->vol_env.num_points > 12 ) {
+					instrument->vol_env.num_points = 0;
+				}
+				instrument->pan_env.num_points = data_u8( data, offset + 226 );
+				if( instrument->pan_env.num_points > 12 ) {
+					instrument->pan_env.num_points = 0;
+				}
+				instrument->vol_env.sustain_tick = instrument->vol_env.points_tick[ data_u8( data, offset + 227 ) & 0xF ];
+				instrument->vol_env.loop_start_tick = instrument->vol_env.points_tick[ data_u8( data, offset + 228 ) & 0xF ];
+				instrument->vol_env.loop_end_tick = instrument->vol_env.points_tick[ data_u8( data, offset + 229 ) & 0xF ];
+				instrument->pan_env.sustain_tick = instrument->pan_env.points_tick[ data_u8( data, offset + 230 ) & 0xF ];
+				instrument->pan_env.loop_start_tick = instrument->pan_env.points_tick[ data_u8( data, offset + 231 ) & 0xF ];
+				instrument->pan_env.loop_end_tick = instrument->pan_env.points_tick[ data_u8( data, offset + 232 ) & 0xF ];
+				instrument->vol_env.enabled = instrument->vol_env.num_points > 0 && ( data_u8( data, offset + 233 ) & 0x1 );
+				instrument->vol_env.sustain = ( data_u8( data, offset + 233 ) & 0x2 ) > 0;
+				instrument->vol_env.looped = ( data_u8( data, offset + 233 ) & 0x4 ) > 0;
+				instrument->pan_env.enabled = instrument->pan_env.num_points > 0 && ( data_u8( data, offset + 234 ) & 0x1 );
+				instrument->pan_env.sustain = ( data_u8( data, offset + 234 ) & 0x2 ) > 0;
+				instrument->pan_env.looped = ( data_u8( data, offset + 234 ) & 0x4 ) > 0;
+				instrument->vib_type = data_u8( data, offset + 235 );
+				instrument->vib_sweep = data_u8( data, offset + 236 );
+				instrument->vib_depth = data_u8( data, offset + 237 );
+				instrument->vib_rate = data_u8( data, offset + 238 );
+				instrument->vol_fadeout = data_u16le( data, offset + 239 );
+			}
+			offset += data_u32le( data, offset );
+			sam_head_offset = offset;
+			offset += num_samples * 40;
+			for( sam = 0; sam < num_samples; sam++ ) {
+				sample = &instrument->samples[ sam ];
+				sam_data_bytes = data_u32le( data, sam_head_offset );
+				sam_loop_start = data_u32le( data, sam_head_offset + 4 );
+				sam_loop_length = data_u32le( data, sam_head_offset + 8 );
+				sample->volume = data_u8( data, sam_head_offset + 12 );
+				sample->fine_tune = data_s8( data, sam_head_offset + 13 );
+				looped = ( data_u8( data, sam_head_offset + 14 ) & 0x3 ) > 0;
+				ping_pong = ( data_u8( data, sam_head_offset + 14 ) & 0x2 ) > 0;
+				sixteen_bit = ( data_u8( data, sam_head_offset + 14 ) & 0x10 ) > 0;
+				sample->panning = data_u8( data, sam_head_offset + 15 ) + 1;
+				sample->rel_note = data_s8( data, sam_head_offset + 16 );
+				data_ascii( data, sam_head_offset + 18, 22, sample->name );
+				sam_head_offset += 40;
+				sam_data_samples = sam_data_bytes;
+				if( sixteen_bit ) {
+					sam_data_samples = sam_data_samples >> 1;
+					sam_loop_start = sam_loop_start >> 1;
+					sam_loop_length = sam_loop_length >> 1;
+				}
+				if( !looped || ( sam_loop_start + sam_loop_length ) > sam_data_samples ) {
+					sam_loop_start = sam_data_samples;
+					sam_loop_length = 0;
+				}
+				sample->loop_start = sam_loop_start;
+				sample->loop_length = sam_loop_length;
+#if IBXM_STREAMING
+				/* Streaming: record source params, defer decode to
+				   ensure_sample() on first channel_trigger. */
+				if( module->stream ) {
+					sample->src_offset = offset;
+					sample->src_length = sam_data_samples;
+					sample->sixteen_bit = sixteen_bit;
+					sample->is_signed = 1;  /* S3M samples are signed */
+					sample->data = NULL;
+					offset += sam_data_bytes;
+					continue;
+				}
+#endif
+				sample->data = ibxm_calloc_dram( sam_data_samples + 1, sizeof( short ) );
+				if( sample->data ) {
+					if( sixteen_bit ) {
+						data_sam_s16le( data, offset, sam_data_samples, sample->data );
+					} else {
+						data_sam_s8( data, offset, sam_data_samples, sample->data );
+					}
+					amp = 0;
+					for( idx = 0; idx < sam_data_samples; idx++ ) {
+						amp = amp + sample->data[ idx ];
+						amp = ( amp & 0x7FFF ) - ( amp & 0x8000 );
+						sample->data[ idx ] = amp;
+					}
+					sample->data[ sam_loop_start + sam_loop_length ] = sample->data[ sam_loop_start ];
+					if( ping_pong ) {
+						sample_ping_pong( sample );
+					}
+				} else {
+					dispose_module( module );
+					ESP_LOGE(TAG, "samples data Failed");
+					return NULL;
+				}
+				offset += sam_data_bytes;
+			}
+		}
+	}
+	return module;
+}
+
+static struct module* module_load_s3m( struct data *data, int stream) {
+	int idx, module_data_idx, inst_offset, flags;
+	int version, sixteen_bit, tune, signed_samples;
+	int stereo_mode, default_pan, channel_map[ 32 ];
+	int sample_offset, sample_length, loop_start, loop_length;
+	int pat_offset, note_offset, row, chan, token;
+	int key, ins, volume, effect, param, panning;
+	char *pattern_data;
+	struct instrument *instrument;
+	struct sample *sample;
+	struct module *module = calloc( 1, sizeof( struct module ) );
+	if( module ) {
+		data_ascii( data, 0, 28, module->name );
+		module->sequence_len = data_u16le( data, 32 );
+		module->num_instruments = data_u16le( data, 34 );
+		module->num_patterns = data_u16le( data, 36 );
+		flags = data_u16le( data, 38 );
+		version = data_u16le( data, 40 );
+		module->fast_vol_slides = ( ( flags & 0x40 ) == 0x40 ) || version == 0x1300;
+		signed_samples = data_u16le( data, 42 ) == 1;
+		if( data_u32le( data, 44 ) != 0x4d524353 ) {
+			ESP_LOGE(TAG, "Not an S3M file!");
+			dispose_module( module );
+			return NULL;
+		}
+		ESP_LOGE(TAG, "S3M hdr: seq=%d ins=%d pat=%d sig=%08x gvol=%d",
+		         module->sequence_len, module->num_instruments,
+		         module->num_patterns, (unsigned)data_u32le(data,44),
+		         module->default_gvol);
+		module->default_gvol = data_u8( data, 48 );
+		module->default_speed = data_u8( data, 49 );
+		module->default_tempo = data_u8( data, 50 );
+		module->c2_rate = 8363;
+		module->gain = data_u8( data, 51 ) & 0x7F;
+		stereo_mode = ( data_u8( data, 51 ) & 0x80 ) == 0x80;
+		default_pan = data_u8( data, 53 ) == 0xFC;
+		for( idx = 0; idx < 32; idx++ ) {
+			channel_map[ idx ] = -1;
+			if( data_u8( data, 64 + idx ) < 16 ) {
+				channel_map[ idx ] = module->num_channels++;
+			}
+			module->channel_map[ idx ] = channel_map[ idx ];
+		}
+#if IBXM_STREAMING
+		module->stream = stream;
+		module->src = data;
+#endif
+		ESP_LOGE(TAG, "S3M stream=%d src=%p", stream, (void*)data);
+		module->sequence = calloc( module->sequence_len, sizeof( unsigned char ) );
+		if( !module->sequence ){
+			ESP_LOGE(TAG, "S3M sequence calloc FAILED len=%d", module->sequence_len);
+			dispose_module( module );
+			return NULL;
+		}
+		for( idx = 0; idx < module->sequence_len; idx++ ) {
+			module->sequence[ idx ] = data_u8( data, 96 + idx );
+		}
+		module_data_idx = 96 + module->sequence_len;
+		module->instruments = calloc( module->num_instruments + 1, sizeof( struct instrument ) );
+		if( !module->instruments ) {
+			ESP_LOGE(TAG, "S3M instruments calloc FAILED num=%d", module->num_instruments);
+			dispose_module( module );
+			return NULL;
+		}
+		module->num_playable = 0;   // count only instruments that actually carry a sample
+		instrument = &module->instruments[ 0 ];
+		instrument->num_samples = 1;
+		instrument->samples = calloc( 1, sizeof( struct sample ) );
+		if( !instrument->samples ) {
+			ESP_LOGE(TAG, "S3M instruments[0].samples calloc FAILED");
+			dispose_module( module );
+			return NULL;
+		}
+		for( ins = 1; ins <= module->num_instruments; ins++ ) {
+			instrument = &module->instruments[ ins ];
+			instrument->num_samples = 1;
+			instrument->samples = calloc( 1, sizeof( struct sample ) );
+			if( !instrument->samples ) {
+				ESP_LOGE(TAG, "S3M instrument->samples calloc FAILED ins=%d", ins);
+				dispose_module( module );
+				return NULL;
+			}
+			sample = &instrument->samples[ 0 ];
+			inst_offset = data_u16le( data, module_data_idx ) << 4;
+			ESP_LOGE(TAG, "S3M ins=%d inst_offset=%d len=%d taken=%d",
+			         ins, inst_offset, (int)module->sequence_len,
+			         ( data_u8( data, inst_offset ) == 1 && data_u16le( data, inst_offset + 76 ) == 0x4353 ));
+			module_data_idx += 2;
+			data_ascii( data, inst_offset + 48, 28, instrument->name );
+			if( data_u8( data, inst_offset ) == 1 && data_u16le( data, inst_offset + 76 ) == 0x4353 ) {
+				sample_offset = ( data_u8( data, inst_offset + 13 ) << 20 )
+					+ ( data_u16le( data, inst_offset + 14 ) << 4 );
+				sample_length = data_u32le( data, inst_offset + 16 );
+				loop_start = data_u32le( data, inst_offset + 20 );
+				loop_length = data_u32le( data, inst_offset + 24 ) - loop_start;
+				sample->volume = data_u8( data, inst_offset + 28 );
+				if( data_u8( data, inst_offset + 30 ) != 0 ) {
+					ESP_LOGE(TAG, "Packed samples not supported!");
+					dispose_module( module );
+					return NULL;
+				}
+				if( loop_start + loop_length > sample_length ) {
+					loop_length = sample_length - loop_start;
+				}
+				if( loop_length < 1 || !( data_u8( data, inst_offset + 31 ) & 0x1 ) ) {
+					loop_start = sample_length;
+					loop_length = 0;
+				}
+				sample->loop_start = loop_start;
+				sample->loop_length = loop_length;
+				/* stereo = data_u8( data, inst_offset + 31 ) & 0x2; */
+				sixteen_bit = data_u8( data, inst_offset + 31 ) & 0x4;
+				tune = ( log_2( data_u32le( data, inst_offset + 32 ) ) - log_2( module->c2_rate ) ) * 12;
+				sample->rel_note = tune >> FP_SHIFT;
+				sample->fine_tune = ( tune & FP_MASK ) >> ( FP_SHIFT - 7 );
+#if IBXM_STREAMING
+				if( module->stream ) {
+					/* Streaming: record source params, defer decode. */
+					sample->src_offset = sample_offset;
+					sample->src_length = sample_length;
+					sample->sixteen_bit = sixteen_bit;
+					sample->is_signed = signed_samples ? 1 : 0;
+					sample->data = NULL;
+					continue;
+				}
+#endif
+				sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
+				sample->data_length = sample_length;
+				if( sample->data ) {
+					ESP_LOGI(TAG, "S3M sample %d len=%d loaded", ins, sample_length);
+					if( sixteen_bit ) {
+						data_sam_s16le( data, sample_offset, sample_length, sample->data );
+					} else {
+						data_sam_s8( data, sample_offset, sample_length, sample->data );
+					}
+					if( !signed_samples ) {
+						for( idx = 0; idx < sample_length; idx++ ) {
+							sample->data[ idx ] = ( sample->data[ idx ] & 0xFFFF ) - 32768;
+						}
+					}
+					sample->data[ loop_start + loop_length ] = sample->data[ loop_start ];
+				module->num_playable++;
+				ESP_LOGE(TAG, "S3M ins=%d sample OK len=%d ls=%d ll=%d", ins, sample_length, loop_start, loop_length);
+				} else {
+					ESP_LOGE(TAG, "S3M sample %d alloc FAILED len=%d", ins, sample_length);
+					dispose_module( module );
+					return NULL;
+				}
+			}
+		}
+		module->patterns = calloc( module->num_patterns, sizeof( struct pattern ) );
+		if( !module->patterns ) {
+			ESP_LOGE(TAG, "S3M patterns calloc FAILED num=%d", module->num_patterns);
+			dispose_module( module );
+			return NULL;
+		}
+		for( idx = 0; idx < module->num_patterns; idx++ ) {
+			module->patterns[ idx ].num_channels = module->num_channels;
+			module->patterns[ idx ].num_rows = 64;
+			module->patterns[ idx ].data = NULL;
+#if IBXM_STREAMING
+			if( module->stream ) {
+				/* Streaming: record packed source offset, defer unpack.
+				   Advance module_data_idx exactly as the eager path would. */
+				module->patterns[ idx ].packed_offset =
+					( data_u16le( data, module_data_idx ) << 4 ) + 2;
+				module_data_idx += 2;
+				continue;
+			}
+#endif
+			pattern_data = ibxm_calloc_psram( module->num_channels * 64, 5 );
+			if( !pattern_data ) {
+				ESP_LOGE(TAG, "S3M pattern_data calloc FAILED ch=%d idx=%d", module->num_channels, idx);
+				dispose_module( module );
+				return NULL;
+			}
+			module->patterns[ idx ].data = pattern_data;
+			pat_offset = ( data_u16le( data, module_data_idx ) << 4 ) + 2;
+			row = 0;
+			while( row < 64 ) {
+				token = data_u8( data, pat_offset++ );
+				if( token ) {
+					key = ins = 0;
+					if( ( token & 0x20 ) == 0x20 ) {
+						/* Key + Instrument.*/
+						key = data_u8( data, pat_offset++ );
+						ins = data_u8( data, pat_offset++ );
+						if( key < 0xFE ) {
+							key = ( key >> 4 ) * 12 + ( key & 0xF ) + 1;
+						} else if( key == 0xFF ) {
+							key = 0;
+						}
+					}
+					volume = 0;
+					if( ( token & 0x40 ) == 0x40 ) {
+						/* Volume Column.*/
+						volume = ( data_u8( data, pat_offset++ ) & 0x7F ) + 0x10;
+						if( volume > 0x50 ) {
+							volume = 0;
+						}
+					}
+					effect = param = 0;
+					if( ( token & 0x80 ) == 0x80 ) {
+						/* Effect + Param.*/
+						effect = data_u8( data, pat_offset++ );
+						param = data_u8( data, pat_offset++ );
+						if( effect < 1 || effect >= 0x40 ) {
+							effect = param = 0;
+						} else if( effect > 0 ) {
+							effect += 0x80;
+						}
+					}
+					chan = channel_map[ token & 0x1F ];
+					if( chan >= 0 ) {
+						note_offset = ( row * module->num_channels + chan ) * 5;
+						pattern_data[ note_offset     ] = key;
+						pattern_data[ note_offset + 1 ] = ins;
+						pattern_data[ note_offset + 2 ] = volume;
+						pattern_data[ note_offset + 3 ] = effect;
+						pattern_data[ note_offset + 4 ] = param;
+					}
+				} else {
+					row++;
+				}
+			}
+			module_data_idx += 2;
+		}
+		module->default_panning = calloc( module->num_channels, sizeof( unsigned char ) );
+		if( module->default_panning ) {
+			for( chan = 0; chan < 32; chan++ ) {
+				if( channel_map[ chan ] >= 0 ) {
+					panning = 7;
+					if( stereo_mode ) {
+						panning = 12;
+						if( data_u8( data, 64 + chan ) < 8 ) {
+							panning = 3;
+						}
+					}
+					if( default_pan ) {
+						flags = data_u8( data, module_data_idx + chan );
+						if( ( flags & 0x20 ) == 0x20 ) {
+							panning = flags & 0xF;
+						}
+					}
+					module->default_panning[ channel_map[ chan ] ] = panning * 17;
+				}
+			}
+		} else {
+			dispose_module( module );
+			return NULL;
+		}
+	}
+	ESP_LOGE(TAG, "S3M LOADED OK module=%p", (void*)module);
+	return module;
+}
+
+static struct module* module_load_mod( struct data *data, int stream) {
+	int idx, pat, module_data_idx, pat_data_len, pat_data_idx;
+	int period, key, ins, effect, param, fine_tune;
+	int sample_length, loop_start, loop_length;
+	char *pattern_data;
+	struct instrument *instrument;
+	struct sample *sample;
+	struct module *module = calloc( 1, sizeof( struct module ) );
+	if( module ) {
+		data_ascii( data, 0, 20, module->name );
+		module->sequence_len = data_u8( data, 950 ) & 0x7F;
+		module->restart_pos = data_u8( data, 951 ) & 0x7F;
+		if( module->restart_pos >= module->sequence_len ) {
+			module->restart_pos = 0;
+		}
+		module->sequence = calloc( 128, sizeof( unsigned char ) );
+		if( !module->sequence ){
+			ESP_LOGE(TAG, "Failed to calloc sequence");
+			dispose_module( module );
+			return NULL;
+		}
+		for( idx = 0; idx < 128; idx++ ) {
+			pat = data_u8( data, 952 + idx ) & 0x7F;
+			module->sequence[ idx ] = pat;
+			if( pat >= module->num_patterns ) {
+				module->num_patterns = pat + 1;
+			}
+		}
+		switch( data_u16be( data, 1082 ) ) {
+			case 0x4b2e: /* M.K. */
+			case 0x4b21: /* M!K! */
+			case 0x5434: /* FLT4 */
+				module->num_channels = 4;
+				module->c2_rate = 8287;
+				module->gain = 64;
+				break;
+			case 0x484e: /* xCHN */
+				module->num_channels = data_u8( data, 1080 ) - 48;
+				module->c2_rate = 8363;
+				module->gain = 32;
+				break;
+			case 0x4348: /* xxCH */
+				module->num_channels = ( data_u8( data, 1080 ) - 48 ) * 10;
+				module->num_channels += data_u8( data, 1081 ) - 48;
+				module->c2_rate = 8363;
+				module->gain = 32;
+				break;
+			default:
+				ESP_LOGE(TAG, "MOD Format not recognised!");
+				dispose_module( module );
+				return NULL;
+		}
+		module->default_gvol = 64;
+		module->default_speed = 6;
+		module->default_tempo = 125;
+		module->default_panning = calloc( module->num_channels, sizeof( unsigned char ) );
+		if( !module->default_panning ) {
+			ESP_LOGE(TAG, "Failed to calloc default_panning");
+			dispose_module( module );
+			return NULL;
+		}
+		for( idx = 0; idx < module->num_channels; idx++ ) {
+			module->default_panning[ idx ] = 51;
+			if( ( idx & 3 ) == 1 || ( idx & 3 ) == 2 ) {
+				module->default_panning[ idx ] = 204;
+			}
+		}
+		module_data_idx = 1084;
+		module->patterns = calloc( module->num_patterns, sizeof( struct pattern ) );
+		if( !module->patterns ) {
+			ESP_LOGE(TAG, "Failed to calloc patterns");
+			dispose_module( module );
+			return NULL;
+		}
+		pat_data_len = module->num_channels * 64 * 5;
+		for( pat = 0; pat < module->num_patterns; pat++ ) {
+			module->patterns[ pat ].num_channels = module->num_channels;
+			module->patterns[ pat ].num_rows = 64;
+			pattern_data = calloc( 1, pat_data_len );
+			if( !pattern_data ) {
+				ESP_LOGE(TAG, "Failed to calloc pattern_data");
+				dispose_module( module );
+				return NULL;
+			}
+			module->patterns[ pat ].data = pattern_data;
+			for( pat_data_idx = 0; pat_data_idx < pat_data_len; pat_data_idx += 5 ) {
+				period = ( data_u8( data, module_data_idx ) & 0xF ) << 8;
+				period = ( period | data_u8( data, module_data_idx + 1 ) ) * 4;
+				if( period >= 112 && period <= 6848 ) {
+					key = -12 * log_2( ( period << FP_SHIFT ) / 29021 );
+					key = ( key + ( key & ( FP_ONE >> 1 ) ) ) >> FP_SHIFT;
+					pattern_data[ pat_data_idx ] = key;
+				}
+				ins = ( data_u8( data, module_data_idx + 2 ) & 0xF0 ) >> 4;
+				ins = ins | ( data_u8( data, module_data_idx ) & 0x10 );
+				pattern_data[ pat_data_idx + 1 ] = ins;
+				effect = data_u8( data, module_data_idx + 2 ) & 0x0F;
+				param  = data_u8( data, module_data_idx + 3 );
+				if( param == 0 && ( effect < 3 || effect == 0xA ) ) {
+					effect = 0;
+				}
+				if( param == 0 && ( effect == 5 || effect == 6 ) ) {
+					effect -= 2;
+				}
+				if( effect == 8 ) {
+					if( module->num_channels == 4 ) {
+						effect = param = 0;
+					} else if( param > 128 ) {
+						param = 128;
+					} else {
+						param = ( param * 255 ) >> 7;
+					}
+				}
+				pattern_data[ pat_data_idx + 3 ] = effect;
+				pattern_data[ pat_data_idx + 4 ] = param;
+				module_data_idx += 4;
+			}
+		}
+		module->num_instruments = 31;
+		module->instruments = calloc( module->num_instruments + 1, sizeof( struct instrument ) );
+		if( !module->instruments ) {
+			ESP_LOGE(TAG, "Failed to calloc instruments");
+			dispose_module( module );
+			return NULL;
+		}
+		instrument = &module->instruments[ 0 ];
+		instrument->num_samples = 1;
+		instrument->samples = calloc( 1, sizeof( struct sample ) );
+		if( !instrument->samples ) {
+			ESP_LOGE(TAG, "Failed to calloc samples");
+			dispose_module( module );
+			return NULL;
+		}
+		for( ins = 1; ins <= module->num_instruments; ins++ ) {
+			instrument = &module->instruments[ ins ];
+			instrument->num_samples = 1;
+			instrument->samples = calloc( 1, sizeof( struct sample ) );
+			if( !instrument->samples ) {
+				ESP_LOGE(TAG, "Failed to calloc samples for instrument");
+				dispose_module( module );
+				return NULL;
+			}
+			sample = &instrument->samples[ 0 ];
+			data_ascii( data, ins * 30 - 10, 22, instrument->name );
+			sample_length = data_u16be( data, ins * 30 + 12 ) * 2;
+			fine_tune = ( data_u8( data, ins * 30 + 14 ) & 0xF ) << 4;
+			sample->fine_tune = ( fine_tune & 0x7F ) - ( fine_tune & 0x80 );
+			sample->volume = data_u8( data, ins * 30 + 15 ) & 0x7F;
+			if( sample->volume > 64 ) {
+				sample->volume = 64;
+			}
+			loop_start = data_u16be( data, ins * 30 + 16 ) * 2;
+			loop_length = data_u16be( data, ins * 30 + 18 ) * 2;
+			if( loop_start + loop_length > sample_length ) {
+				if( loop_start / 2 + loop_length <= sample_length ) {
+					/* Some old modules have loop start in bytes. */
+					loop_start = loop_start / 2;
+				} else {
+					loop_length = sample_length - loop_start;
+				}
+			}
+			if( loop_length < 4 ) {
+				loop_start = sample_length;
+				loop_length = 0;
+			}
+			sample->loop_start = loop_start;
+			sample->loop_length = loop_length;
+#if IBXM_STREAMING
+			if( module->stream ) {
+				/* Streaming: record source params, defer decode.
+				   MOD samples are 8-bit unsigned at module_data_idx. */
+				sample->src_offset = module_data_idx;
+				sample->src_length = sample_length;
+				sample->sixteen_bit = 0;
+				sample->is_signed = 0;
+				sample->data = NULL;
+				continue;
+			}
+#endif
+			sample->data = ibxm_calloc_dram( sample_length + 1, sizeof( short ) );
+			sample->data_length = sample_length;
+			if( sample->data ) {
+				data_sam_s8( data, module_data_idx, sample_length, sample->data );
+				sample->data[ loop_start + loop_length ] = sample->data[ loop_start ];
+			} else {
+				ESP_LOGE(TAG, "Failed to calloc sample data");
+				dispose_module( module );
+				return NULL;
+			}
+			module_data_idx += sample_length;
+		}
+	}
+	return module;
+}
+
+/* Allocate and initialize a module from the specified data, returns NULL on error.
+   Message should point to a 64-character buffer to receive error messages. */
+struct module* module_load( struct data *data) {
+	return module_load_ex( data, 0 );
+}
+
+struct module* module_load_ex( struct data *data, int stream ) {
+	char ascii[ 16 ];
+	struct module* module;
+	if( !memcmp( data_ascii( data, 0, 16, ascii ), "Extended Module:", 16 ) ) {
+		ESP_LOGE(TAG, "DISPATCH: XM");
+		module = module_load_xm( data, stream );
+	} else if( !memcmp( data_ascii( data, 44, 4, ascii ), "SCRM", 4 ) ) {
+		ESP_LOGE(TAG, "DISPATCH: S3M sig=%08x", (unsigned)data_u32le(data,44));
+		module = module_load_s3m( data, stream );
+		ESP_LOGE(TAG, "DBG after s3m load free_dram=%u", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+	} else {
+		ESP_LOGE(TAG, "DISPATCH: MOD");
+		module = module_load_mod( data, stream );
+	}
+	/* Only the S3M loader sets up streaming (src/stream/channel_map). XM/MOD
+	   decode eagerly and leave module->stream = 0 (calloc-zeroed), so the
+	   ensure_* helpers fall back to the eager path. */
+#if IBXM_STREAMING
+	if( module && module->stream ) {
+		module->src = data;
+	}
+#endif
+	return module;
+}
+
+static void pattern_get_note( struct module *module, struct pattern *pattern, int row, int chan, struct note *dest ) {
+	int offset = ( row * pattern->num_channels + chan ) * 5;
+	if( module->seq_muted ) {
+		/* Ibmxchord direct-trigger mode: the sequencer injects no notes. */
+		memset( dest, 0, sizeof( struct note ) );
+		return;
+	}
+	if( offset >= 0 && row < pattern->num_rows && chan < pattern->num_channels ) {
+#if IBXM_STREAMING
+		if( ensure_pattern( module, (int)( pattern - module->patterns ) ) != 0 ) {
+			static int ep_noisy = 8;
+			if( ep_noisy > 0 ) {
+				ep_noisy--;
+				ESP_LOGE(TAG, "pattern_get_note: ensure_pattern FAILED pat=%d",
+				         (int)(pattern - module->patterns));
+			}
+			memset( dest, 0, sizeof( struct note ) );
+			return;
+		}
+#endif
+		dest->key = pattern->data[ offset ];
+		dest->instrument = pattern->data[ offset + 1 ];
+		dest->volume = pattern->data[ offset + 2 ];
+		dest->effect = pattern->data[ offset + 3 ];
+		dest->param = pattern->data[ offset + 4 ];
+	} else {
+		memset( dest, 0, sizeof( struct note ) );
+	}
+}
+
+static void channel_init( struct channel *channel, struct replay *replay, int idx ) {
+	memset( channel, 0, sizeof( struct channel ) );
+	channel->replay = replay;
+	channel->id = idx;
+	channel->panning = replay->module->default_panning[ idx ];
+	channel->instrument = &replay->module->instruments[ 0 ];
+	channel->sample = &channel->instrument->samples[ 0 ];
+	channel->random_seed = ( idx + 1 ) * 0xABCDEF;
+}
+
+static void channel_volume_slide( struct channel *channel ) {
+	int up = channel->vol_slide_param >> 4;
+	int down = channel->vol_slide_param & 0xF;
+	if( down == 0xF && up > 0 ) {
+		/* Fine slide up.*/
+		if( channel->fx_count == 0 ) {
+			channel->volume += up;
+		}
+	} else if( up == 0xF && down > 0 ) {
+		/* Fine slide down.*/
+		if( channel->fx_count == 0 ) {
+			channel->volume -= down;
+		}
+	} else if( channel->fx_count > 0 || channel->replay->module->fast_vol_slides ) {
+		/* Normal.*/
+		channel->volume += up - down;
+	}
+	if( channel->volume > 64 ) {
+		channel->volume = 64;
+	}
+	if( channel->volume < 0 ) {
+		channel->volume = 0;
+	}
+}
+
+static void channel_porta_up( struct channel *channel, int param ) {
+	switch( param & 0xF0 ) {
+		case 0xE0: /* Extra-fine porta.*/
+			if( channel->fx_count == 0 ) {
+				channel->period -= param & 0xF;
+			}
+			break;
+		case 0xF0: /* Fine porta.*/
+			if( channel->fx_count == 0 ) {
+				channel->period -= ( param & 0xF ) << 2;
+			}
+			break;
+		default:/* Normal porta.*/
+			if( channel->fx_count > 0 ) {
+				channel->period -= param << 2;
+			}
+			break;
+	}
+	if( channel->period < 0 ) {
+		channel->period = 0;
+	}
+}
+
+static void channel_porta_down( struct channel *channel, int param ) {
+	if( channel->period > 0 ) {
+		switch( param & 0xF0 ) {
+			case 0xE0: /* Extra-fine porta.*/
+				if( channel->fx_count == 0 ) {
+					channel->period += param & 0xF;
+				}
+				break;
+			case 0xF0: /* Fine porta.*/
+				if( channel->fx_count == 0 ) {
+					channel->period += ( param & 0xF ) << 2;
+				}
+				break;
+			default:/* Normal porta.*/
+				if( channel->fx_count > 0 ) {
+					channel->period += param << 2;
+				}
+				break;
+		}
+		if( channel->period > 65535 ) {
+			channel->period = 65535;
+		}
+	}
+}
+
+static void channel_tone_porta( struct channel *channel ) {
+	if( channel->period > 0 ) {
+		if( channel->period < channel->porta_period ) {
+			channel->period += channel->tone_porta_param << 2;
+			if( channel->period > channel->porta_period ) {
+				channel->period = channel->porta_period;
+			}
+		} else {
+			channel->period -= channel->tone_porta_param << 2;
+			if( channel->period < channel->porta_period ) {
+				channel->period = channel->porta_period;
+			}
+		}
+	}
+}
+
+static int channel_waveform( struct channel *channel, int phase, int type ) {
+	int amplitude = 0;
+	switch( type ) {
+		default: /* Sine. */
+			amplitude = sine_table[ phase & 0x1F ];
+			if( ( phase & 0x20 ) > 0 ) {
+				amplitude = -amplitude;
+			}
+			break;
+		case 6: /* Saw Up.*/
+			amplitude = ( ( ( phase + 0x20 ) & 0x3F ) << 3 ) - 255;
+			break;
+		case 1: case 7: /* Saw Down. */
+			amplitude = 255 - ( ( ( phase + 0x20 ) & 0x3F ) << 3 );
+			break;
+		case 2: case 5: /* Square. */
+			amplitude = ( phase & 0x20 ) > 0 ? 255 : -255;
+			break;
+		case 3: case 8: /* Random. */
+			amplitude = ( channel->random_seed >> 20 ) - 255;
+			channel->random_seed = ( channel->random_seed * 65 + 17 ) & 0x1FFFFFFF;
+			break;
+	}
+	return amplitude;
+}
+
+static void channel_vibrato( struct channel *channel, int fine ) {
+	int wave = channel_waveform( channel, channel->vibrato_phase, channel->vibrato_type & 0x3 );
+	channel->vibrato_add = wave * channel->vibrato_depth >> ( fine ? 7 : 5 );
+}
+
+static void channel_tremolo( struct channel *channel ) {
+	int wave = channel_waveform( channel, channel->tremolo_phase, channel->tremolo_type & 0x3 );
+	channel->tremolo_add = wave * channel->tremolo_depth >> 6;
+}
+
+static void channel_tremor( struct channel *channel ) {
+	if( channel->retrig_count >= channel->tremor_on_ticks ) {
+		channel->tremolo_add = -64;
+	}
+	if( channel->retrig_count >= ( channel->tremor_on_ticks + channel->tremor_off_ticks ) ) {
+		channel->tremolo_add = channel->retrig_count = 0;
+	}
+}
+
+static void channel_retrig_vol_slide( struct channel *channel ) {
+	if( channel->retrig_count >= channel->retrig_ticks ) {
+		channel->retrig_count = channel->sample_idx = channel->sample_fra = 0;
+		switch( channel->retrig_volume ) {
+			case 0x1: channel->volume = channel->volume -  1; break;
+			case 0x2: channel->volume = channel->volume -  2; break;
+			case 0x3: channel->volume = channel->volume -  4; break;
+			case 0x4: channel->volume = channel->volume -  8; break;
+			case 0x5: channel->volume = channel->volume - 16; break;
+			case 0x6: channel->volume = channel->volume * 2 / 3; break;
+			case 0x7: channel->volume = channel->volume >> 1; break;
+			case 0x8: /* ? */ break;
+			case 0x9: channel->volume = channel->volume +  1; break;
+			case 0xA: channel->volume = channel->volume +  2; break;
+			case 0xB: channel->volume = channel->volume +  4; break;
+			case 0xC: channel->volume = channel->volume +  8; break;
+			case 0xD: channel->volume = channel->volume + 16; break;
+			case 0xE: channel->volume = channel->volume * 3 / 2; break;
+			case 0xF: channel->volume = channel->volume << 1; break;
+		}
+		if( channel->volume <  0 ) {
+			channel->volume = 0;
+		}
+		if( channel->volume > 64 ) {
+			channel->volume = 64;
+		}
+	}
+}
+
+static void channel_trigger( struct channel *channel ) {
+	int key, sam, porta, period, fine_tune, ins = channel->note.instrument;
+	struct sample *sample;
+	struct module *module = channel->replay->module;
+	if( ins > 0 && ins <= module->num_instruments ) {
+		channel->instrument = &module->instruments[ ins ];
+		key = channel->note.key < 97 ? channel->note.key : 0;
+		sam = channel->instrument->key_to_sample[ key ];
+		sample = &channel->instrument->samples[ sam ];
+#if IBXM_STREAMING
+		/* Streaming: ensure the sample PCM is resident before use. Drop the
+		   in_use ref on the previously-bound sample first. */
+		if( channel->sample && channel->sample->in_use > 0 ) {
+			channel->sample->in_use--;
+		}
+		if( ensure_sample( module, sample ) != 0 ) {
+			/* Decode failed (DRAM exhausted); skip this trigger. */
+			channel->sample = &channel->instrument->samples[ 0 ];
+			channel->sample_off = 0;
+			return;
+		}
+#endif
+		channel->volume = sample->volume >= 64 ? 64 : sample->volume & 0x3F;
+		if( sample->panning > 0 ) {
+			channel->panning = ( sample->panning - 1 ) & 0xFF;
+		}
+		if( channel->period > 0 && sample->loop_length > 1 ) {
+			/* Amiga trigger.*/
+			channel->sample = sample;
+#if IBXM_STREAMING
+			sample->in_use++;
+#endif
+		}
+		channel->sample_off = 0;
+		channel->vol_env_tick = channel->pan_env_tick = 0;
+		channel->fadeout_vol = 32768;
+		channel->key_on = 1;
+		channel->release_fade = 0;
+	}
+	if( channel->note.effect == 0x09 || channel->note.effect == 0x8F ) {
+		/* Set Sample Offset. */
+		if( channel->note.param > 0 ) {
+			channel->offset_param = channel->note.param;
+		}
+		channel->sample_off = channel->offset_param << 8;
+	}
+	if( channel->note.volume >= 0x10 && channel->note.volume < 0x60 ) {
+		channel->volume = channel->note.volume < 0x50 ? channel->note.volume - 0x10 : 64;
+	}
+	switch( channel->note.volume & 0xF0 ) {
+		case 0x80: /* Fine Vol Down.*/
+			channel->volume -= channel->note.volume & 0xF;
+			if( channel->volume < 0 ) {
+				channel->volume = 0;
+			}
+			break;
+		case 0x90: /* Fine Vol Up.*/
+			channel->volume += channel->note.volume & 0xF;
+			if( channel->volume > 64 ) {
+				channel->volume = 64;
+			}
+			break;
+		case 0xA0: /* Set Vibrato Speed.*/
+			if( ( channel->note.volume & 0xF ) > 0 ) {
+				channel->vibrato_speed = channel->note.volume & 0xF;
+			}
+			break;
+		case 0xB0: /* Vibrato.*/
+			if( ( channel->note.volume & 0xF ) > 0 ) {
+				channel->vibrato_depth = channel->note.volume & 0xF;
+			}
+			channel_vibrato( channel, 0 );
+			break;
+		case 0xC0: /* Set Panning.*/
+			channel->panning = ( channel->note.volume & 0xF ) * 17;
+			break;
+		case 0xF0: /* Tone Porta.*/
+			if( ( channel->note.volume & 0xF ) > 0 ) {
+				channel->tone_porta_param = channel->note.volume & 0xF;
+			}
+			break;
+	}
+	if( channel->note.key > 0 ) {
+		if( channel->note.key > 96 ) {
+			channel->key_on = 0;
+		} else {
+			porta = ( channel->note.volume & 0xF0 ) == 0xF0 ||
+				channel->note.effect == 0x03 || channel->note.effect == 0x05 ||
+				channel->note.effect == 0x87 || channel->note.effect == 0x8C;
+			if( !porta ) {
+				ins = channel->instrument->key_to_sample[ channel->note.key ];
+				channel->sample = &channel->instrument->samples[ ins ];
+			}
+			fine_tune = channel->sample->fine_tune;
+			if( channel->note.effect == 0x75 || channel->note.effect == 0xF2 ) {
+				/* Set Fine Tune. */
+				fine_tune = ( ( channel->note.param & 0xF ) << 4 ) - 128;
+			}
+			key = channel->note.key + channel->sample->rel_note;
+			if( key < 1 ) {
+				key = 1;
+			}
+			if( key > 120 ) {
+				key = 120;
+			}
+			period = ( key << 6 ) + ( fine_tune >> 1 );
+			if( channel->replay->module->linear_periods ) {
+				channel->porta_period = 7744 - period;
+			} else {
+				channel->porta_period = 29021 * exp_2( ( period << FP_SHIFT ) / -768 ) >> FP_SHIFT;
+			}
+			if( !porta ) {
+				channel->period = channel->porta_period;
+				channel->sample_idx = channel->sample_off;
+				channel->sample_fra = 0;
+				if( channel->vibrato_type < 4 ) {
+					channel->vibrato_phase = 0;
+				}
+				if( channel->tremolo_type < 4 ) {
+					channel->tremolo_phase = 0;
+				}
+				channel->retrig_count = channel->av_count = 0;
+			}
+		}
+	}
+}
+
+static void channel_update_envelopes( struct channel *channel ) {
+	if( channel->instrument->vol_env.enabled ) {
+		if( !channel->key_on ) {
+			channel->fadeout_vol -= channel->instrument->vol_fadeout;
+			if( channel->fadeout_vol < 0 ) {
+				channel->fadeout_vol = 0;
+			}
+		}
+		channel->vol_env_tick = envelope_next_tick( &channel->instrument->vol_env,
+			channel->vol_env_tick, channel->key_on );
+	} else if( !channel->key_on && channel->release_fade > 0 ) {
+		/* Ibmxchord release tail for instruments with no volume envelope: the
+		   engine would otherwise cut to silence instantly on key-off. */
+		channel->fadeout_vol -= channel->release_fade;
+		if( channel->fadeout_vol < 0 ) {
+			channel->fadeout_vol = 0;
+		}
+	}
+	if( channel->instrument->pan_env.enabled ) {
+		channel->pan_env_tick = envelope_next_tick( &channel->instrument->pan_env,
+			channel->pan_env_tick, channel->key_on );
+	}
+}
+
+static void channel_auto_vibrato( struct channel *channel ) {
+	int sweep, rate, type, wave;
+	int depth = channel->instrument->vib_depth & 0x7F;
+	if( depth > 0 ) {
+		sweep = channel->instrument->vib_sweep & 0x7F;
+		rate = channel->instrument->vib_rate & 0x7F;
+		type = channel->instrument->vib_type;
+		if( channel->av_count < sweep ) {
+			depth = depth * channel->av_count / sweep;
+		}
+		wave = channel_waveform( channel, channel->av_count * rate >> 2, type + 4 );
+		channel->vibrato_add += wave * depth >> 8;
+		channel->av_count++;
+	}
+}
+
+static void channel_calculate_freq( struct channel *channel ) {
+	int per = channel->period + channel->vibrato_add;
+	if( channel->replay->module->linear_periods ) {
+		per = per - ( channel->arpeggio_add << 6 );
+		if( per < 28 || per > 7680 ) {
+			per = 7680;
+		}
+		channel->freq = ( ( channel->replay->module->c2_rate >> 4 )
+			* exp_2( ( ( 4608 - per ) << FP_SHIFT ) / 768 ) ) >> ( FP_SHIFT - 4 );
+	} else {
+		if( per > 29021 ) {
+			per = 29021;
+		}
+		per = ( per << FP_SHIFT ) / exp_2( ( channel->arpeggio_add << FP_SHIFT ) / 12 );
+		if( per < 28 ) {
+			per = 29021;
+		}
+		channel->freq = channel->replay->module->c2_rate * 1712 / per;
+	}
+}
+
+static void channel_calculate_ampl( struct channel *channel ) {
+	int vol, range, env_pan = 32;
+	int env_vol;
+	if( channel->key_on ) {
+		env_vol = 64;
+	} else if( channel->instrument->vol_env.enabled ) {
+		env_vol = 0;	/* envelope handles the release via vol_env_tick */
+	} else {
+		/* No volume envelope: derive a release tail from fadeout_vol so the
+		   note decays instead of cutting dead on key-off (Ibmxchord sustain). */
+		env_vol = channel->fadeout_vol >> 9;	/* 32768 -> 64, 0 -> 0 */
+		if( env_vol > 64 ) env_vol = 64;
+	}
+	if( channel->instrument->vol_env.enabled ) {
+		env_vol = envelope_calculate_ampl( &channel->instrument->vol_env, channel->vol_env_tick );
+	}
+	vol = channel->volume + channel->tremolo_add;
+	if( vol > 64 ) {
+		vol = 64;
+	}
+	if( vol < 0 ) {
+		vol = 0;
+	}
+	vol = ( vol * channel->replay->module->gain * FP_ONE ) >> 13;
+	vol = ( vol * channel->fadeout_vol ) >> 15;
+	channel->ampl = ( vol * channel->replay->global_vol * env_vol ) >> 12;
+	if( channel->instrument->pan_env.enabled ) {
+		env_pan = envelope_calculate_ampl( &channel->instrument->pan_env, channel->pan_env_tick );
+	}
+	range = ( channel->panning < 128 ) ? channel->panning : ( 255 - channel->panning );
+	channel->pann = channel->panning + ( range * ( env_pan - 32 ) >> 5 );
+}
+
+static void channel_tick( struct channel *channel ) {
+	channel->vibrato_add = 0;
+	channel->fx_count++;
+	channel->retrig_count++;
+	if( !( channel->note.effect == 0x7D && channel->fx_count <= channel->note.param ) ) {
+		switch( channel->note.volume & 0xF0 ) {
+			case 0x60: /* Vol Slide Down.*/
+				channel->volume -= channel->note.volume & 0xF;
+				if( channel->volume < 0 ) {
+					channel->volume = 0;
+				}
+				break;
+			case 0x70: /* Vol Slide Up.*/
+				channel->volume += channel->note.volume & 0xF;
+				if( channel->volume > 64 ) {
+					channel->volume = 64;
+				}
+				break;
+			case 0xB0: /* Vibrato.*/
+				channel->vibrato_phase += channel->vibrato_speed;
+				channel_vibrato( channel, 0 );
+				break;
+			case 0xD0: /* Pan Slide Left.*/
+				channel->panning -= channel->note.volume & 0xF;
+				if( channel->panning < 0 ) {
+					channel->panning = 0;
+				}
+				break;
+			case 0xE0: /* Pan Slide Right.*/
+				channel->panning += channel->note.volume & 0xF;
+				if( channel->panning > 255 ) {
+					channel->panning = 255;
+				}
+				break;
+			case 0xF0: /* Tone Porta.*/
+				channel_tone_porta( channel );
+				break;
+		}
+	}
+	switch( channel->note.effect ) {
+		case 0x01: case 0x86: /* Porta Up. */
+			channel_porta_up( channel, channel->porta_up_param );
+			break;
+		case 0x02: case 0x85: /* Porta Down. */
+			channel_porta_down( channel, channel->porta_down_param );
+			break;
+		case 0x03: case 0x87: /* Tone Porta. */
+			channel_tone_porta( channel );
+			break;
+		case 0x04: case 0x88: /* Vibrato. */
+			channel->vibrato_phase += channel->vibrato_speed;
+			channel_vibrato( channel, 0 );
+			break;
+		case 0x05: case 0x8C: /* Tone Porta + Vol Slide. */
+			channel_tone_porta( channel );
+			channel_volume_slide( channel );
+			break;
+		case 0x06: case 0x8B: /* Vibrato + Vol Slide. */
+			channel->vibrato_phase += channel->vibrato_speed;
+			channel_vibrato( channel, 0 );
+			channel_volume_slide( channel );
+			break;
+		case 0x07: case 0x92: /* Tremolo. */
+			channel->tremolo_phase += channel->tremolo_speed;
+			channel_tremolo( channel );
+			break;
+		case 0x0A: case 0x84: /* Vol Slide. */
+			channel_volume_slide( channel );
+			break;
+		case 0x11: /* Global Volume Slide. */
+			channel->replay->global_vol = channel->replay->global_vol
+				+ ( channel->gvol_slide_param >> 4 )
+				- ( channel->gvol_slide_param & 0xF );
+			if( channel->replay->global_vol < 0 ) {
+				channel->replay->global_vol = 0;
+			}
+			if( channel->replay->global_vol > 64 ) {
+				channel->replay->global_vol = 64;
+			}
+			break;
+		case 0x19: /* Panning Slide. */
+			channel->panning = channel->panning
+				+ ( channel->pan_slide_param >> 4 )
+				- ( channel->pan_slide_param & 0xF );
+			if( channel->panning < 0 ) {
+				channel->panning = 0;
+			}
+			if( channel->panning > 255 ) {
+				channel->panning = 255;
+			}
+			break;
+		case 0x1B: case 0x91: /* Retrig + Vol Slide. */
+			channel_retrig_vol_slide( channel );
+			break;
+		case 0x1D: case 0x89: /* Tremor. */
+			channel_tremor( channel );
+			break;
+		case 0x79: /* Retrig. */
+			if( channel->fx_count >= channel->note.param ) {
+				channel->fx_count = 0;
+				channel->sample_idx = channel->sample_fra = 0;
+			}
+			break;
+		case 0x7C: case 0xFC: /* Note Cut. */
+			if( channel->note.param == channel->fx_count ) {
+				channel->volume = 0;
+			}
+			break;
+		case 0x7D: case 0xFD: /* Note Delay. */
+			if( channel->note.param == channel->fx_count ) {
+				channel_trigger( channel );
+			}
+			break;
+		case 0x8A: /* Arpeggio. */
+			if( channel->fx_count == 1 ) {
+				channel->arpeggio_add = channel->arpeggio_param >> 4;
+			} else if( channel->fx_count == 2 ) {
+				channel->arpeggio_add = channel->arpeggio_param & 0xF;
+			} else {
+				channel->arpeggio_add = channel->fx_count = 0;
+			}
+			break;
+		case 0x95: /* Fine Vibrato. */
+			channel->vibrato_phase += channel->vibrato_speed;
+			channel_vibrato( channel, 1 );
+			break;
+	}
+	channel_auto_vibrato( channel );
+	channel_calculate_freq( channel );
+	channel_calculate_ampl( channel );
+	channel_update_envelopes( channel );
+}
+
+static void channel_row( struct channel *channel, struct note *note ) {
+	channel->note = *note;
+	channel->retrig_count++;
+	channel->vibrato_add = channel->tremolo_add = channel->arpeggio_add = channel->fx_count = 0;
+	if( !( ( note->effect == 0x7D || note->effect == 0xFD ) && note->param > 0 ) ) {
+		/* Not note delay.*/
+		channel_trigger( channel );
+	}
+	switch( channel->note.effect ) {
+		case 0x01: case 0x86: /* Porta Up. */
+			if( channel->note.param > 0 ) {
+				channel->porta_up_param = channel->note.param;
+			}
+			channel_porta_up( channel, channel->porta_up_param );
+			break;
+		case 0x02: case 0x85: /* Porta Down. */
+			if( channel->note.param > 0 ) {
+				channel->porta_down_param = channel->note.param;
+			}
+			channel_porta_down( channel, channel->porta_down_param );
+			break;
+		case 0x03: case 0x87: /* Tone Porta. */
+			if( channel->note.param > 0 ) {
+				channel->tone_porta_param = channel->note.param;
+			}
+			break;
+		case 0x04: case 0x88: /* Vibrato. */
+			if( ( channel->note.param >> 4 ) > 0 ) {
+				channel->vibrato_speed = channel->note.param >> 4;
+			}
+			if( ( channel->note.param & 0xF ) > 0 ) {
+				channel->vibrato_depth = channel->note.param & 0xF;
+			}
+			channel_vibrato( channel, 0 );
+			break;
+		case 0x05: case 0x8C: /* Tone Porta + Vol Slide. */
+			if( channel->note.param > 0 ) {
+				channel->vol_slide_param = channel->note.param;
+			}
+			channel_volume_slide( channel );
+			break;
+		case 0x06: case 0x8B: /* Vibrato + Vol Slide. */
+			if( channel->note.param > 0 ) {
+				channel->vol_slide_param = channel->note.param;
+			}
+			channel_vibrato( channel, 0 );
+			channel_volume_slide( channel );
+			break;
+		case 0x07: case 0x92: /* Tremolo. */
+			if( ( channel->note.param >> 4 ) > 0 ) {
+				channel->tremolo_speed = channel->note.param >> 4;
+			}
+			if( ( channel->note.param & 0xF ) > 0 ) {
+				channel->tremolo_depth = channel->note.param & 0xF;
+			}
+			channel_tremolo( channel );
+			break;
+		case 0x08: /* Set Panning.*/
+			channel->panning = channel->note.param & 0xFF;
+			break;
+		case 0x0A: case 0x84: /* Vol Slide. */
+			if( channel->note.param > 0 ) {
+				channel->vol_slide_param = channel->note.param;
+			}
+			channel_volume_slide( channel );
+			break;
+		case 0x0C: /* Set Volume. */
+			channel->volume = channel->note.param >= 64 ? 64 : channel->note.param & 0x3F;
+			break;
+		case 0x10: case 0x96: /* Set Global Volume. */
+			channel->replay->global_vol = channel->note.param >= 64 ? 64 : channel->note.param & 0x3F;
+			break;
+		case 0x11: /* Global Volume Slide. */
+			if( channel->note.param > 0 ) {
+				channel->gvol_slide_param = channel->note.param;
+			}
+			break;
+		case 0x14: /* Key Off. */
+			channel->key_on = 0;
+			break;
+		case 0x15: /* Set Envelope Tick. */
+			channel->vol_env_tick = channel->pan_env_tick = channel->note.param & 0xFF;
+			break;
+		case 0x19: /* Panning Slide. */
+			if( channel->note.param > 0 ) {
+				channel->pan_slide_param = channel->note.param;
+			}
+			break;
+		case 0x1B: case 0x91: /* Retrig + Vol Slide. */
+			if( ( channel->note.param >> 4 ) > 0 ) {
+				channel->retrig_volume = channel->note.param >> 4;
+			}
+			if( ( channel->note.param & 0xF ) > 0 ) {
+				channel->retrig_ticks = channel->note.param & 0xF;
+			}
+			channel_retrig_vol_slide( channel );
+			break;
+		case 0x1D: case 0x89: /* Tremor. */
+			if( ( channel->note.param >> 4 ) > 0 ) {
+				channel->tremor_on_ticks = channel->note.param >> 4;
+			}
+			if( ( channel->note.param & 0xF ) > 0 ) {
+				channel->tremor_off_ticks = channel->note.param & 0xF;
+			}
+			channel_tremor( channel );
+			break;
+		case 0x21: /* Extra Fine Porta. */
+			if( channel->note.param > 0 ) {
+				channel->xfine_porta_param = channel->note.param;
+			}
+			switch( channel->xfine_porta_param & 0xF0 ) {
+				case 0x10:
+					channel_porta_up( channel, 0xE0 | ( channel->xfine_porta_param & 0xF ) );
+					break;
+				case 0x20:
+					channel_porta_down( channel, 0xE0 | ( channel->xfine_porta_param & 0xF ) );
+					break;
+			}
+			break;
+		case 0x71: /* Fine Porta Up. */
+			if( channel->note.param > 0 ) {
+				channel->fine_porta_up_param = channel->note.param;
+			}
+			channel_porta_up( channel, 0xF0 | ( channel->fine_porta_up_param & 0xF ) );
+			break;
+		case 0x72: /* Fine Porta Down. */
+			if( channel->note.param > 0 ) {
+				channel->fine_porta_down_param = channel->note.param;
+			}
+			channel_porta_down( channel, 0xF0 | ( channel->fine_porta_down_param & 0xF ) );
+			break;
+		case 0x74: case 0xF3: /* Set Vibrato Waveform. */
+			if( channel->note.param < 8 ) {
+				channel->vibrato_type = channel->note.param;
+			}
+			break;
+		case 0x77: case 0xF4: /* Set Tremolo Waveform. */
+			if( channel->note.param < 8 ) {
+				channel->tremolo_type = channel->note.param;
+			}
+			break;
+		case 0x7A: /* Fine Vol Slide Up. */
+			if( channel->note.param > 0 ) {
+				channel->fine_vslide_up_param = channel->note.param;
+			}
+			channel->volume += channel->fine_vslide_up_param;
+			if( channel->volume > 64 ) {
+				channel->volume = 64;
+			}
+			break;
+		case 0x7B: /* Fine Vol Slide Down. */
+			if( channel->note.param > 0 ) {
+				channel->fine_vslide_down_param = channel->note.param;
+			}
+			channel->volume -= channel->fine_vslide_down_param;
+			if( channel->volume < 0 ) {
+				channel->volume = 0;
+			}
+			break;
+		case 0x7C: case 0xFC: /* Note Cut. */
+			if( channel->note.param <= 0 ) {
+				channel->volume = 0;
+			}
+			break;
+		case 0x8A: /* Arpeggio. */
+			if( channel->note.param > 0 ) {
+				channel->arpeggio_param = channel->note.param;
+			}
+			break;
+		case 0x95: /* Fine Vibrato.*/
+			if( ( channel->note.param >> 4 ) > 0 ) {
+				channel->vibrato_speed = channel->note.param >> 4;
+			}
+			if( ( channel->note.param & 0xF ) > 0 ) {
+				channel->vibrato_depth = channel->note.param & 0xF;
+			}
+			channel_vibrato( channel, 1 );
+			break;
+		case 0xF8: /* Set Panning. */
+			channel->panning = channel->note.param * 17;
+			break;
+	}
+	channel_auto_vibrato( channel );
+	channel_calculate_freq( channel );
+	channel_calculate_ampl( channel );
+	channel_update_envelopes( channel );
+}
+
+static void channel_resample( struct channel *channel, int *mix_buf,
+		int offset, int count, int sample_rate, int interpolate ) {
+	struct sample *sample = channel->sample;
+	int l_gain, r_gain, sam_idx, sam_fra, step;
+	int loop_len, loop_end, out_idx, out_end, y, m, c;
+	short *sample_data = channel->sample->data;
+	if( channel->ampl > 0 ) {
+		l_gain = channel->ampl * ( 255 - channel->pann ) >> 8;
+		r_gain = channel->ampl * channel->pann >> 8;
+		sam_idx = channel->sample_idx;
+		sam_fra = channel->sample_fra;
+		step = ( channel->freq << ( FP_SHIFT - 3 ) ) / ( sample_rate >> 3 );
+		loop_len = sample->loop_length;
+		loop_end = sample->loop_start + loop_len;
+		out_idx = offset * 2;
+		out_end = ( offset + count ) * 2;
+		if( interpolate ) {
+			while( out_idx < out_end ) {
+				if( sam_idx >= loop_end ) {
+					if( loop_len > 1 ) {
+						while( sam_idx >= loop_end ) {
+							sam_idx -= loop_len;
+						}
+					} else {
+						break;
+					}
+				}
+				c = sample_data[ sam_idx ];
+				m = sample_data[ sam_idx + 1 ] - c;
+				y = ( ( m * sam_fra ) >> FP_SHIFT ) + c;
+				mix_buf[ out_idx++ ] += ( y * l_gain ) >> FP_SHIFT;
+				mix_buf[ out_idx++ ] += ( y * r_gain ) >> FP_SHIFT;
+				sam_fra += step;
+				sam_idx += sam_fra >> FP_SHIFT;
+				sam_fra &= FP_MASK;
+			}
+		} else {
+			while( out_idx < out_end ) {
+				if( sam_idx >= loop_end ) {
+					if( loop_len > 1 ) {
+						while( sam_idx >= loop_end ) {
+							sam_idx -= loop_len;
+						}
+					} else {
+						break;
+					}
+				}
+				y = sample_data[ sam_idx ];
+				mix_buf[ out_idx++ ] += ( y * l_gain ) >> FP_SHIFT;
+				mix_buf[ out_idx++ ] += ( y * r_gain ) >> FP_SHIFT;
+				sam_fra += step;
+				sam_idx += sam_fra >> FP_SHIFT;
+				sam_fra &= FP_MASK;
+			}
+		}
+	}
+}
+
+static void channel_update_sample_idx( struct channel *channel, int count, int sample_rate ) {
+	struct sample *sample = channel->sample;
+	int step = ( channel->freq << ( FP_SHIFT - 3 ) ) / ( sample_rate >> 3 );
+	channel->sample_fra += step * count;
+	channel->sample_idx += channel->sample_fra >> FP_SHIFT;
+	if( channel->sample_idx > sample->loop_start ) {
+		if( sample->loop_length > 1 ) {
+			channel->sample_idx = sample->loop_start
+				+ ( channel->sample_idx - sample->loop_start ) % sample->loop_length;
+		} else {
+			channel->sample_idx = sample->loop_start;
+		}
+	}
+	channel->sample_fra &= FP_MASK;
+}
+
+static void replay_row( struct replay *replay ) {
+	int idx, count;
+	struct note note;
+	struct pattern *pattern;
+	struct channel *channel;
+	struct module *module = replay->module;
+	if( replay->next_row < 0 ) {
+		replay->break_pos = replay->seq_pos + 1;
+		replay->next_row = 0;
+	}
+	if( replay->break_pos >= 0 ) {
+		if( replay->break_pos >= module->sequence_len ) {
+			replay->break_pos = replay->next_row = 0;
+		}
+		while( module->sequence[ replay->break_pos ] >= module->num_patterns ) {
+			replay->break_pos++;
+			if( replay->break_pos >= module->sequence_len ) {
+				replay->break_pos = replay->next_row = 0;
+			}
+		}
+		replay->seq_pos = replay->break_pos;
+		for( idx = 0; idx < module->num_channels; idx++ ) {
+			replay->channels[ idx ].pl_row = 0;
+		}
+		replay->break_pos = -1;
+	}
+	pattern = &module->patterns[ module->sequence[ replay->seq_pos ] ];
+	{
+		static int sp_last = -1, sp_noisy = 8;
+		if( replay->seq_pos != sp_last ) {
+			sp_last = replay->seq_pos;
+			if( sp_noisy > 0 ) {
+				sp_noisy--;
+				ESP_LOGE(TAG, "replay_row: seq_pos=%d pat=%d",
+				         replay->seq_pos,
+				         module->sequence[ replay->seq_pos ]);
+			}
+		}
+	}
+	replay->row = replay->next_row;
+	if( replay->row >= pattern->num_rows ) {
+		replay->row = 0;
+	}
+	if( replay->play_count && replay->play_count[ 0 ] ) {
+		count = replay->play_count[ replay->seq_pos ][ replay->row ];
+		if( replay->pl_count < 0 && count < 127 ) {
+			replay->play_count[ replay->seq_pos ][ replay->row ] = count + 1;
+		}
+	}
+	replay->next_row = replay->row + 1;
+	if( replay->next_row >= pattern->num_rows ) {
+		replay->next_row = -1;
+	}
+	for( idx = 0; idx < module->num_channels; idx++ ) {
+		channel = &replay->channels[ idx ];
+		pattern_get_note( module, pattern, replay->row, idx, &note );
+		if( note.effect == 0xE ) {
+			note.effect = 0x70 | ( note.param >> 4 );
+			note.param &= 0xF;
+		}
+		if( note.effect == 0x93 ) {
+			note.effect = 0xF0 | ( note.param >> 4 );
+			note.param &= 0xF;
+		}
+		if( note.effect == 0 && note.param > 0 ) {
+			note.effect = 0x8A;
+		}
+		channel_row( channel, &note );
+		switch( note.effect ) {
+			case 0x81: /* Set Speed. */
+				if( note.param > 0 ) {
+					replay->tick = replay->speed = note.param;
+				}
+				break;
+			case 0xB: case 0x82: /* Pattern Jump.*/
+				if( replay->pl_count < 0 ) {
+					replay->break_pos = note.param;
+					replay->next_row = 0;
+				}
+				break;
+			case 0xD: case 0x83: /* Pattern Break.*/
+				if( replay->pl_count < 0 ) {
+					if( replay->break_pos < 0 ) {
+						replay->break_pos = replay->seq_pos + 1;
+					}
+					replay->next_row = ( note.param >> 4 ) * 10 + ( note.param & 0xF );
+				}
+				break;
+			case 0xF: /* Set Speed/Tempo.*/
+				if( note.param > 0 ) {
+					if( note.param < 32 ) {
+						replay->tick = replay->speed = note.param;
+					} else {
+						replay->tempo = note.param;
+					}
+				}
+				break;
+			case 0x94: /* Set Tempo.*/
+				if( note.param > 32 ) {
+					replay->tempo = note.param;
+				}
+				break;
+			case 0x76: case 0xFB : /* Pattern Loop.*/
+				if( note.param == 0 ) {
+					/* Set loop marker on this channel. */
+					channel->pl_row = replay->row;
+				}
+				if( channel->pl_row < replay->row && replay->break_pos < 0 ) {
+					/* Marker valid. */
+					if( replay->pl_count < 0 ) {
+						/* Not already looping, begin. */
+						replay->pl_count = note.param;
+						replay->pl_chan = idx;
+					}
+					if( replay->pl_chan == idx ) {
+						/* Next Loop.*/
+						if( replay->pl_count == 0 ) {
+							/* Loop finished. Invalidate current marker. */
+							channel->pl_row = replay->row + 1;
+						} else {
+							/* Loop. */
+							replay->next_row = channel->pl_row;
+						}
+						replay->pl_count--;
+					}
+				}
+				break;
+			case 0x7E: case 0xFE: /* Pattern Delay.*/
+				replay->tick = replay->speed + replay->speed * note.param;
+				break;
+		}
+	}
+}
+
+static int replay_tick( struct replay *replay ) {
+	int idx, num_channels, count = 1;
+	if( --replay->tick <= 0 ) {
+		replay->tick = replay->speed;
+		replay_row( replay );
+	} else {
+		num_channels = replay->module->num_channels;
+		for( idx = 0; idx < num_channels; idx++ ) {
+			channel_tick( &replay->channels[ idx ] );
+		}
+	}
+	if( replay->play_count && replay->play_count[ 0 ] ) {
+		count = replay->play_count[ replay->seq_pos ][ replay->row ] - 1;
+	}
+	return count;
+}
+
+static int module_init_play_count( struct module *module, char **play_count ) {
+	int idx, pat, rows, len = 0;
+	for( idx = 0; idx < module->sequence_len; idx++ ) {
+		pat = module->sequence[ idx ];
+		rows = ( pat < module->num_patterns ) ? module->patterns[ pat ].num_rows : 0;
+		if( play_count ) {
+			play_count[ idx ] = play_count[ 0 ] ? &play_count[ 0 ][ len ] : NULL;
+		}
+		len += rows;
+	}
+	return len;
+}
+
+/* Set the pattern in the sequence to play. The tempo is reset to the default. */
+void replay_set_sequence_pos( struct replay *replay, int pos ) {
+	int idx;
+	struct module *module = replay->module;
+	if( pos >= module->sequence_len ) {
+		pos = 0;
+	}
+	replay->break_pos = pos;
+	replay->next_row = 0;
+	replay->tick = 1;
+	replay->global_vol = module->default_gvol;
+	replay->speed = module->default_speed > 0 ? module->default_speed : 6;
+	replay->tempo = module->default_tempo > 0 ? module->default_tempo : 125;
+	replay->pl_count = replay->pl_chan = -1;
+	if( replay->play_count ) {
+		free( replay->play_count[ 0 ] );
+		free( replay->play_count );
+	}
+	replay->play_count = calloc( module->sequence_len, sizeof( char * ) );
+	if( replay->play_count ) {
+		replay->play_count[ 0 ] = calloc( module_init_play_count( module, NULL ), sizeof( char ) );
+		module_init_play_count( module, replay->play_count );
+	}
+	for( idx = 0; idx < module->num_channels; idx++ ) {
+		channel_init( &replay->channels[ idx ], replay, idx );
+	}
+	memset( replay->ramp_buf, 0, 128 * sizeof( int ) );
+	replay_tick( replay );
+}
+
+/* Deallocate the specified replay. */
+void dispose_replay( struct replay *replay ) {
+	if( replay->play_count ) {
+		free( replay->play_count[ 0 ] );
+		free( replay->play_count );
+	}
+	free( replay->ramp_buf );
+	free( replay->channels );
+	free( replay );
+}
+
+/* Allocate and initialize a replay with the specified sampling rate and interpolation. */
+struct replay* new_replay( struct module *module, int sample_rate, int interpolation ) {
+	struct replay *replay = calloc( 1, sizeof( struct replay ) );
+	if( replay ) {
+		replay->module = module;
+		replay->sample_rate = sample_rate;
+		replay->interpolation = interpolation;
+		replay->ramp_buf = calloc( 128, sizeof( int ) );
+		replay->channels = calloc( module->num_channels, sizeof( struct channel ) );
+		if( replay->ramp_buf && replay->channels ) {
+			replay_set_sequence_pos( replay, 0 );
+		} else {
+			dispose_replay( replay );
+			replay = NULL;
+		}
+	}
+	return replay;
+}
+
+static int calculate_tick_len( int tempo, int sample_rate ) {
+	return ( sample_rate * 5 ) / ( tempo * 2 );
+}
+
+int replay_calculate_tick_len( struct replay *replay) {
+	return calculate_tick_len(replay->tempo, replay->sample_rate);
+}
+
+/* Returns the length of the output buffer required by replay_get_audio(). */
+int calculate_mix_buf_len( int sample_rate ) {
+	return ( calculate_tick_len( 32, sample_rate ) + 65 ) * 4;
+}
+
+/* Returns the song duration in samples at the current sampling rate. */
+int replay_calculate_duration( struct replay *replay ) {
+	int count = 0, duration = 0;
+	replay_set_sequence_pos( replay, 0 );
+	while( count < 1 ) {
+		duration += calculate_tick_len( replay->tempo, replay->sample_rate );
+		count = replay_tick( replay );
+	}
+	replay_set_sequence_pos( replay, 0 );
+	return duration;
+}
+
+/* Seek to approximately the specified sample position.
+   The actual sample position reached is returned. */
+int replay_seek( struct replay *replay, int sample_pos ) {
+	int idx, tick_len, current_pos = 0;
+	replay_set_sequence_pos( replay, 0 );
+	tick_len = calculate_tick_len( replay->tempo, replay->sample_rate );
+	while( ( sample_pos - current_pos ) >= tick_len ) {
+		for( idx = 0; idx < replay->module->num_channels; idx++ ) {
+			channel_update_sample_idx( &replay->channels[ idx ],
+				tick_len * 2, replay->sample_rate * 2 );
+		}
+		current_pos += tick_len;
+		replay_tick( replay );
+		tick_len = calculate_tick_len( replay->tempo, replay->sample_rate );
+	}
+	return current_pos;
+}
+
+static void replay_volume_ramp( struct replay *replay, int *mix_buf, int tick_len ) {
+	int idx, a1, a2, ramp_rate = 256 * 2048 / replay->sample_rate;
+	for( idx = 0, a1 = 0; a1 < 256; idx += 2, a1 += ramp_rate ) {
+		a2 = 256 - a1;
+		mix_buf[ idx     ] = ( mix_buf[ idx     ] * a1 + replay->ramp_buf[ idx     ] * a2 ) >> 8;
+		mix_buf[ idx + 1 ] = ( mix_buf[ idx + 1 ] * a1 + replay->ramp_buf[ idx + 1 ] * a2 ) >> 8;
+	}
+	memcpy( replay->ramp_buf, &mix_buf[ tick_len * 2 ], 128 * sizeof( int ) );
+}
+
+/* 2:1 downsampling with simple but effective anti-aliasing. Buf must contain count * 2 + 1 stereo samples. */
+static void downsample( int *buf, int count ) {
+	int idx, out_idx, out_len = count * 2;
+	for( idx = 0, out_idx = 0; out_idx < out_len; idx += 4, out_idx += 2 ) {
+		buf[ out_idx     ] = ( buf[ idx     ] >> 2 ) + ( buf[ idx + 2 ] >> 1 ) + ( buf[ idx + 4 ] >> 2 );
+		buf[ out_idx + 1 ] = ( buf[ idx + 1 ] >> 2 ) + ( buf[ idx + 3 ] >> 1 ) + ( buf[ idx + 5 ] >> 2 );
+	}
+}
+
+/* Generates audio and returns the number of stereo samples written into mix_buf. */
+int replay_get_audio( struct replay *replay, int *mix_buf, int tick_len ) {
+	struct channel *channel;
+	int idx, num_channels;
+	//, tick_len = calculate_tick_len( replay->tempo, replay->sample_rate );
+	/* Clear output buffer. */
+	memset( mix_buf, 0, (tick_len + 65) * 4 * sizeof( int ) );
+	/* Resample. */
+	num_channels = replay->module->num_channels;
+	for( idx = 0; idx < num_channels; idx++ ) {
+		channel = &replay->channels[ idx ];
+		channel_resample( channel, mix_buf, 0, ( tick_len + 65 ) * 2, replay->sample_rate * 2, replay->interpolation );
+		channel_update_sample_idx( channel, tick_len * 2, replay->sample_rate * 2);
+	}
+	downsample( mix_buf, tick_len + 64 );
+	replay_volume_ramp( replay, mix_buf, tick_len );
+	replay_tick( replay );
+	return tick_len;
+}
+
+struct ibxm_player * play_module(struct data *d, int sample_rate, int interpolation) {
+	struct ibxm_player *player;
+	player = (struct ibxm_player *) malloc(sizeof(struct ibxm_player));
+	if( !player ) {
+		ESP_LOGE(TAG, "Failed to allocate player");
+		return NULL;
+	}
+	/* Initialise module + replay. */
+	player->module = module_load(d);
+	ESP_LOGE(TAG, "PLAY_MODULE: module=%p channels=%d",
+	         (void*)player->module,
+	         player->module ? player->module->num_channels : -1);
+	if( player->module ) {
+		player->replay = new_replay( player->module, sample_rate, interpolation );
+		ESP_LOGE(TAG, "PLAY_MODULE: replay=%p", (void*)player->replay);
+		if( player->replay ) {
+			player->tick_len = replay_calculate_tick_len( player->replay );
+			player->duration = replay_calculate_duration( player->replay );
+			LOGI(TAG, "Duration: %02i:%02i:%02i",
+				(player->duration / (1000 * 60 * 60)),
+				(player->duration / (1000 * 60)) % 60,
+				(player->duration / 1000) % 60 );
+			LOGI(TAG, "Tick Len: %i", player->tick_len);
+			return player;
+		}
+		dispose_module( player->module );
+	}
+	free( player );
+	return NULL;
+}
+
+struct ibxm_player * openFile(char *filename, int sample_rate, int interpolation) {
+ 	static FILE* f;
+	struct data d;
+	struct ibxm_player *player;
+
+	f = fopen(filename, "r");
+	if (f == NULL) {
+		LOGE(TAG, "Failed to open file for reading");
+		return NULL;
+	}
+	fseek( f , 0L , SEEK_END);
+	d.length = ftell( f );
+	rewind(f);
+    LOGI(TAG, "Largest free block left: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    d.buffer = ibxm_calloc_psram(d.length,  sizeof(char));
+    LOGI(TAG, "Largest free block left: %u", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+
+	if(d.buffer==NULL) {
+		LOGE(TAG, "Failed to allocate memory for module data: %u", (unsigned)d.length);
+		fclose(f);
+		return NULL;
+	}
+
+	fread(d.buffer, sizeof(signed char), d.length, f);
+	fclose(f);
+
+    LOGI(TAG, "mod_data_len: %i", d.length);
+
+	player = play_module(&d, sample_rate, interpolation);
+	if( player == NULL ) {
+		free(d.buffer);
+		return NULL;
+	}
+	free(d.buffer);
+    return player;
+}
+
+struct ibxm_player * openArray(const uint8_t *dataIn, uint32_t len, int sample_rate, int interpolation) {
+	struct ibxm_player *player;
+	struct data d;
+
+    d.buffer = (char *) dataIn;
+    d.length = len;
+
+	/* The buffer here is durable (flash mmap on ESP32, or a const array on
+	   the host), so enable on-demand streaming to keep the S3M's PCM +
+	   pattern tables from all being resident at once. */
+	player = play_module_stream(&d, sample_rate, interpolation, 1);
+	return player;
+}
+
+struct ibxm_player * play_module_stream(struct data *d, int sample_rate, int interpolation, int stream) {
+	struct ibxm_player *player;
+	player = (struct ibxm_player *) malloc(sizeof(struct ibxm_player));
+	if( !player ) {
+		ESP_LOGE(TAG, "Failed to allocate player");
+		return NULL;
+	}
+	player->module = module_load_ex(d, stream);
+	ESP_LOGE(TAG, "PLAY_MODULE: module=%p channels=%d stream=%d",
+	         (void*)player->module,
+	         player->module ? player->module->num_channels : -1,
+	         player->module ? player->module->stream : -1);
+	if( player->module ) {
+		player->replay = new_replay( player->module, sample_rate, interpolation );
+		ESP_LOGE(TAG, "PLAY_MODULE: replay=%p", (void*)player->replay);
+		if( player->replay ) {
+			player->tick_len = replay_calculate_tick_len( player->replay );
+#if IBXM_STREAMING
+			/* Streaming: skip replay_calculate_duration() — it marches the
+			   whole song decoding every sample up front, exhausting the DRAM
+			   sample cache. Replay is already at sequence pos 0 from
+			   new_replay(). */
+			player->duration = 0;
+			LOGI(TAG, "Tick Len: %i (duration skipped in streaming mode)", player->tick_len);
+#else
+			player->duration = replay_calculate_duration( player->replay );
+			LOGI(TAG, "Duration: %02i:%02i:%02i",
+				(player->duration / (1000 * 60 * 60)),
+				(player->duration / (1000 * 60)) % 60,
+				(player->duration / 1000) % 60 );
+			LOGI(TAG, "Tick Len: %i", player->tick_len);
+#endif
+			return player;
+		}
+		dispose_module( player->module );
+	}
+	free( player );
+	return NULL;
+}
+
+/* ---- Direct instrument trigger API (Ibmxchord mode) ---- */
+
+void ibxm_sequence_mute( struct ibxm_player *player ) {
+	if( player && player->module ) {
+		player->module->seq_muted = 1;
+	}
+}
+
+void ibxm_sequence_unmute( struct ibxm_player *player ) {
+	if( player && player->module ) {
+		player->module->seq_muted = 0;
+	}
+}
+
+/* Stop all sounding voices and restart the pattern sequencer from the top. */
+void ibxm_restart( struct ibxm_player *player ) {
+	int i;
+	if( !player || !player->replay ) return;
+	for( i = 0; i < player->module->num_channels; i++ ) {
+		ibxm_note_off( player, i );
+	}
+	replay_set_sequence_pos( player->replay, 0 );
+}
+
+/* Authoritative "we are NOT playing the track" state: mute the pattern sequencer
+   so it can never inject notes, then hard-stop every channel. This is the single
+   call the app should make whenever it leaves "play original" mode (init, stop,
+   track load) so a looping/stuck voice from the sequence cannot keep sounding. */
+void ibxm_sequence_stop( struct ibxm_player *player ) {
+	int i;
+	if( !player || !player->replay || !player->module ) return;
+	player->module->seq_muted = 1;
+	for( i = 0; i < player->module->num_channels; i++ ) {
+		ibxm_channel_stop( player, i );
+	}
+}
+
+/* Authoritative "we ARE playing the track" state: unmute the sequencer and
+   restart it from the top. */
+void ibxm_sequence_play( struct ibxm_player *player ) {
+	if( !player || !player->replay || !player->module ) return;
+	player->module->seq_muted = 0;
+	replay_set_sequence_pos( player->replay, 0 );
+}
+
+/* An instrument is "available" if it declares at least one sample in its
+   instrument struct (num_samples > 0). We key off the instrument's own
+   num_samples count rather than inspecting each sample's decoded wave, per the
+   Ibmxchord design: any instrument that the module says has samples is selectable. */
+static int instrument_playable( struct module *module, int ins ) {
+	struct instrument *instr;
+	if( ins < 1 || ins > module->num_instruments ) return 0;
+	instr = &module->instruments[ ins ];
+	return instr->num_samples > 0;
+}
+
+/* Return the next 1-based instrument index (>= 1) that carries a real wave,
+   starting the search just after `from` and wrapping at num_instruments.
+   Returns `from` unchanged if no *other* playable instrument exists, so a
+   caller stepping from `from` can never spin forever. Skips instrument 0
+   (the library's reserved empty slot). */
+int ibxm_next_instrument( struct ibxm_player *player, int from ) {
+	int i, n, total;
+	if( !player || !player->module ) return 0;
+	n = player->module->num_instruments;
+	total = n + 1;   /* scan from from+1 through from+n, wrapping, to cover all slots once */
+	for( i = 1; i <= total; i++ ) {
+		int cand = from + i;
+		while( cand > n ) cand -= n;          /* wrap into 1..n */
+		if( cand == 0 ) cand = 1;
+		if( cand == from ) break;              /* covered every slot, none found */
+		if( instrument_playable( player->module, cand ) ) return cand;
+	}
+	return from;
+}
+
+char *ibxm_instrument_name( struct ibxm_player *player, int ins, char *buf, int len ) {
+	if( !buf || len < 1 ) return buf;
+	buf[ 0 ] = '\0';
+	if( !player || !player->module ) return buf;
+	if( ins < 1 || ins > player->module->num_instruments ) return buf;
+	{
+		struct instrument *instr = &player->module->instruments[ ins ];
+		int i, n = 0;
+		for( i = 0; i < 31 && n < len - 1; i++ ) {
+			char c = instr->name[ i ];
+			if( c == '\0' ) break;
+			buf[ n++ ] = c;
+		}
+		buf[ n ] = '\0';
+	}
+	return buf;
+}
+void ibxm_note_on( struct ibxm_player *player, int channel, int key, int instrument, int volume ) {
+	struct note n;
+	if( !player || !player->replay || channel < 0 ||
+			channel >= player->module->num_channels ) {
+		return;
+	}
+	memset( &n, 0, sizeof( struct note ) );
+	n.key = key > 96 ? 96 : ( key < 1 ? 1 : key );
+	n.instrument = instrument > 0 ? instrument : 1;
+	n.volume = volume > 0 ? volume : 0x40;  /* 0x40 = full volume in tracker notation */
+	channel_row( &player->replay->channels[ channel ], &n );
+}
+
+void ibxm_note_off( struct ibxm_player *player, int channel ) {
+	struct note n;
+	if( !player || !player->replay || channel < 0 ||
+			channel >= player->module->num_channels ) {
+		return;
+	}
+	memset( &n, 0, sizeof( struct note ) );
+	n.key = 97;  /* >= 97 = Key Off in the tracker engine */
+	channel_row( &player->replay->channels[ channel ], &n );
+	/* Ibmxchord: guarantee every released note terminates. Arm a short per-channel
+	   fade regardless of whether the instrument has a volume envelope — some
+	   modules ship vol_fadeout=0, which would otherwise leave a looping sample
+	   sustaining forever. The release_fade branch in channel_update_envelopes runs
+	   for any key-off channel, so this hard-cuts the tail (~0.4s). */
+	player->replay->channels[ channel ].release_fade = 2048;
+}
+
+/* Hard channel stop: fully re-initialise the channel to a silent, idle state.
+   Unlike ibxm_note_off (which only sends a key-off and relies on the instrument's
+   own release/sustain to finish), this zeroes the active voice immediately so a
+   stuck or looping sample on a particular track cannot keep sounding. */
+void ibxm_channel_stop( struct ibxm_player *player, int channel ) {
+	if( !player || !player->replay || channel < 0 ||
+			channel >= player->module->num_channels ) {
+		return;
+	}
+	channel_init( &player->replay->channels[ channel ], player->replay, channel );
+	player->replay->channels[ channel ].key_on = 0;
+	player->replay->channels[ channel ].ampl  = 0;
+	player->replay->channels[ channel ].pann  = 0;
+	player->replay->channels[ channel ].fadeout_vol = 0;
+	player->replay->channels[ channel ].release_fade = 0;
+}
