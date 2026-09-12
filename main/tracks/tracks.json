@@ -48,12 +48,6 @@
     "format": "MOD 4CH"
   },
   {
-    "file": "airwave-aberration_mix.xm",
-    "title": "Airwave (Aberration)",
-    "artist": "Aberration",
-    "format": "XM 32CH"
-  },
-  {
     "file": "castlevania.mod",
     "title": "Castlevania 4",
     "artist": "Sam",
